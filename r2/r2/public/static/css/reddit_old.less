@@ -7793,16 +7793,15 @@ body:not(.gold) .allminus-link {
     width: 100%;
 }
 
-form#banned textarea {
-    display: block;
-    margin-left: 0;
+.friend-add.edited .ban-details { display: block; }
+
+.ban-details {
+    display: none;
 }
 
-div.usertable .note {
-  color: #808080;
-  font-size: 0.8em;
-  white-space: normal;
-  margin-bottom: 10px;
+.ban-details > textarea {
+    display: block;
+    margin-left: 0;
 }
 
 .gold-accent h1,
@@ -10500,6 +10499,3 @@ body.banned.deleted div#header {
 #compose-message select {
     font-size: 100%;
 }
-
-@import "mit.less";
-
