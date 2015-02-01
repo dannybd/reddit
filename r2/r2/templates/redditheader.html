@@ -65,7 +65,7 @@
 
   <div id="header-bottom-right">
     %if not c.user_is_loggedin:
-      %if thing.enable_login_cover and not g.read_only_mode:
+      %if False: # thing.enable_login_cover and not g.read_only_mode:
       <span class="user">
         <%
           base = g.https_endpoint if not c.cname else ""
