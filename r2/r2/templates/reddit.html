@@ -161,7 +161,7 @@
 
     ${thing.footer}
 
-    %if not c.user_is_loggedin and not g.read_only_mode:
+    %if False: #not c.user_is_loggedin and g.read_only_mode:
       %if thing.enable_login_cover:
         %if feature.is_enabled('new_login_flow'):
           <script>
