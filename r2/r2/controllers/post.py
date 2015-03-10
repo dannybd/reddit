@@ -143,6 +143,9 @@ class PostController(ApiController):
     def GET_login(self, *a, **kw):
         return self.redirect('/login' + query_string(dict(dest="/")))
 
+    def GET_login_shib(self, *a, **kw):
+        return self.redirect('/login_shib' + query_string(dict(dest="/")))
+
     @validatedForm(
         VUser(),
         VModhash(),

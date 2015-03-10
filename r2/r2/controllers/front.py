@@ -1393,6 +1393,12 @@ class FormsController(RedditController):
             return self.redirect(dest)
         return LoginPage(dest=dest).render()
 
+    @validate(dest=VDestination())
+    def GET_login_shib(self, dest):
+        if (c.user_is_loggedin and
+            not request.environ.get('extension') == 'embed'):
+            return self.redirect(dest)
+        return LoginPage(dest=dest).render()
 
     @validate(dest=VDestination())
     def GET_register(self, dest):

@@ -904,6 +904,7 @@ class RedditFooter(CachedTemplate):
                 type = "flat_vert",
                 separator = "")
         ]
+        self.nav = []
         CachedTemplate.__init__(self)
 
 class ClickGadget(Templated):

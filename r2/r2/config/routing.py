@@ -57,7 +57,8 @@ def make_map():
     mc('/crossdomain', controller='robots', action='crossdomain')
 
     mc('/login', controller='forms', action='login')
-    mc('/register', controller='forms', action='register')
+    # mc('/register', controller='forms', action='register')
+    mc('/login_shib', controller='forms', action='login_shib')
     mc('/logout', controller='forms', action='logout')
     mc('/verify', controller='forms', action='verify')
     mc('/adminon', controller='forms', action='adminon')
