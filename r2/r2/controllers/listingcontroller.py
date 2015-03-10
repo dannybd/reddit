@@ -365,7 +365,7 @@ class ListingWithPromos(SubredditListingController):
         interestbar_prob = g.live_config['spotlight_interest_sub_p'
                                          if has_subscribed else
                                          'spotlight_interest_nosub_p']
-        interestbar = InterestBar(has_subscribed)
+        interestbar = None # InterestBar(has_subscribed)
 
         s = SpotlightListing(organic_links=organic_links,
                              interestbar=interestbar,
