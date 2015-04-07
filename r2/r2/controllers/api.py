@@ -588,6 +588,15 @@ class ApiController(RedditController):
             responder._send_data(hsts_redir=hsts_redir)
         responder._send_data(need_https=user.https_forced)
 
+    def _handle_shib_login(self, name, affiliation):
+        try:
+            user = register(name, 'foobar', request.ip)
+        except AccountExists: 
+            user = Account._by_name(name)    
+        c.user = user
+        c.user_is_loggedin = True
+        self.login(user, rem = None)
+
     @validatedForm(VLoggedOut(),
                    user = VThrottledLogin(['user', 'passwd']),
                    rem = VBoolean('rem'))

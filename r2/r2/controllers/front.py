@@ -1404,6 +1404,10 @@ class FormsController(RedditController):
 
         return PrefsPage(content=content, infotext=infotext).render()
 
+    @validate(dest=VDestination())
+    def GET_debug(self, dest):
+        return BoringPage(_("DEBUG"),
+            show_sidebar=False, content=repr(request.environ)).render()
 
     @validate(dest=VDestination())
     def GET_login(self, dest):
@@ -1412,13 +1416,11 @@ class FormsController(RedditController):
         cover).  However, this page is still used for logging the user
         in during submission or voting from the bookmarklets."""
 
-        if (c.user_is_loggedin and
-            not request.environ.get('extension') == 'embed'):
-            return self.redirect(dest)
-        return LoginPage(dest=dest).render()
+        if (not request.environ.get('REMOTE_USER')):
+            return self.redirect('/shib-login' + query_string(dict(dest="/")))
+            return BoringPage(_("DEBUG"),
+                          show_sidebar=False, content=repr(request.environ)).render()
 
-    @validate(dest=VDestination())
-    def GET_login_shib(self, dest):
         if (c.user_is_loggedin and
             not request.environ.get('extension') == 'embed'):
             return self.redirect(dest)

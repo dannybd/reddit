@@ -58,7 +58,6 @@ def make_map():
 
     mc('/login', controller='forms', action='login')
     # mc('/register', controller='forms', action='register')
-    mc('/login_shib', controller='forms', action='login_shib')
     mc('/logout', controller='forms', action='logout')
     mc('/verify', controller='forms', action='verify')
     mc('/adminon', controller='forms', action='adminon')
@@ -262,7 +261,10 @@ def make_map():
     mc('/health/ads', controller='health', action='promohealth')
     mc('/health/caches', controller='health', action='cachehealth')
 
-    mc('/', controller='hot', action='listing')
+    # MIT fix
+    mc('/', controller='forms', action='debug')
+    mc('/shib-login', controller='post', action='shib_login')
+    mc('/home', controller='hot', action='listing')
 
     mc('/:controller', action='listing',
        requirements=dict(controller="hot|new|rising|randomrising|ads"))

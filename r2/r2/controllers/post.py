@@ -109,6 +109,38 @@ class PostController(ApiController):
                                            sent = True,
                                            msg_hash = msg_hash)).render()
 
+    @validate(dest=VDestination(default='/'))
+    def GET_shib_login(self, dest):
+        def get_valid_local_part(email):
+            if not email or len(email.split('@')) != 2:
+                return False
+            local, domain = email.split('@')
+            if domain != 'mit.edu':
+                return False
+            return local
+        def parse_GET(query_string):
+            GET = {}
+            args = query_string.split('&')
+            for arg in args:
+                t = arg.split('=')
+                if len(t) != 2:
+                    continue
+                k, v = t
+                GET[k] = v
+            return GET
+        test = {}
+        user = get_valid_local_part(request.environ['HTTP_REMOTE_USER'])
+        affiliation = request.environ['HTTP_AFFILIATION']
+        if affiliation and len(affiliation.split(';')) > 1:
+            affiliation = affiliation.split(';')[0]
+        affiliation = get_valid_local_part(affiliation)
+        GET = parse_GET(request.environ['QUERY_STRING'])
+        # destination = '%2F'
+        # if 'dest' in GET:
+        #     destination = GET['dest']
+        # destination = unquote(destination).decode('utf8')
+        ApiController._handle_shib_login(self, user, affiliation)
+        return self.redirect(dest)
 
     @csrf_exempt
     @validate(dest = VDestination(default = "/"))
@@ -138,9 +170,6 @@ class PostController(ApiController):
 
     def GET_login(self, *a, **kw):
         return self.redirect('/login' + query_string(dict(dest="/")))
-
-    def GET_login_shib(self, *a, **kw):
-        return self.redirect('/login_shib' + query_string(dict(dest="/")))
 
     @validatedForm(
         VUser(),
