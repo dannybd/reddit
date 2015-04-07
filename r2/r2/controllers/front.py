@@ -1406,6 +1406,9 @@ class FormsController(RedditController):
 
     @validate(dest=VDestination())
     def GET_debug(self, dest):
+        if (c.user_is_loggedin and
+            not request.environ.get('extension') == 'embed'):
+            return self.redirect('/home')
         return BoringPage(_("DEBUG"),
             show_sidebar=False, content=repr(request.environ)).render()
 
