@@ -114,6 +114,7 @@ import hashlib
 import re
 import urllib
 import urllib2
+import os
 
 def reject_vote(thing):
     voteword = request.params.get('dir')
@@ -590,7 +591,7 @@ class ApiController(RedditController):
 
     def _handle_shib_login(self, name, affiliation):
         try:
-            user = register(name, 'foobar', request.ip)
+            user = register(name, os.urandom(128).encode('hex'), request.ip)
         except AccountExists: 
             user = Account._by_name(name)    
         c.user = user
