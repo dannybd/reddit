@@ -142,6 +142,16 @@ class PostController(ApiController):
         ApiController._handle_shib_login(self, user, affiliation)
         return self.redirect(dest)
 
+    def GET_login_check(self, *a, **kw):
+        if not c.user_is_loggedin:
+            abort(403)
+        return "200 OK Logged In"
+
+    @validate(dest = VDestination(default = "/"))
+    def GET_login_required(self, dest, *a, **kw):
+        return BoringPage(_("login please"), content="You need to login",
+                         show_sidebar=False).render()
+
     @csrf_exempt
     @validate(dest = VDestination(default = "/"))
     def POST_login(self, dest, *a, **kw):

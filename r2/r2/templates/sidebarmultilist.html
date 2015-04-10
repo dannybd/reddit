@@ -20,10 +20,12 @@
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
-<ul id="side-multi-list">
-%for multi in thing.multis:
-  <li><a href="${multi.path}" title="${multi.name}">${multi.name}</a></li>
-%endfor
-</ul>
-
-<script>new r.ui.Summarize($('#side-multi-list'), 15)</script>
+%if False:
+  <ul id="side-multi-list">
+  %for multi in thing.multis:
+    <li><a href="${multi.path}" title="${multi.name}">${multi.name}</a></li>
+  %endfor
+  </ul>
+  
+  <script>new r.ui.Summarize($('#side-multi-list'), 15)</script>
+%endif
