@@ -418,7 +418,7 @@ class HotController(ListingWithPromos):
             return normalized_hot(sr_ids)
         elif isinstance(c.site, MultiReddit):
             return normalized_hot(c.site.kept_sr_ids, obey_age_limit=False,
-                                  ageweight=c.site.normalized_age_weight)
+                                  ageweight=c.site.ageweight)
         else:
             if c.site.sticky_fullname:
                 link_list = [c.site.sticky_fullname]
@@ -457,17 +457,31 @@ class HotController(ListingWithPromos):
 
     def content(self):
         content = super(HotController, self).content()
-        if (c.render_style == "html" and isinstance(c.site, DefaultSR) and
-                not self.listing_obj.prev):
-            trending_info = self.trending_info()
-            if trending_info:
-                return PaneStack(filter(None, [
-                    self.spotlight,
-                    TrendingSubredditsBar(**trending_info),
-                    self.listing_obj,
-                ]), css_class='spacer')
-        return content
 
+        if c.render_style == "html":
+            stack = None
+            if isinstance(c.site, DefaultSR) and not self.listing_obj.prev:
+                trending_info = self.trending_info()
+                if trending_info:
+                    stack = [
+                        self.spotlight,
+                        TrendingSubredditsBar(**trending_info),
+                        self.listing_obj,
+                    ]
+            else:
+                hot_hook = hooks.get_hook("hot.get_content")
+                hot_pane = hot_hook.call_until_return(controller=self)
+                if hot_pane:
+                    stack = [
+                        self.spotlight,
+                        hot_pane,
+                        self.listing_obj
+                    ]
+
+            if stack:
+                return PaneStack(filter(None, stack), css_class='spacer')
+
+        return content
 
     def title(self):
         return c.site.title
@@ -742,8 +756,10 @@ class UserController(ListingController):
 
             if c.user == self.vuser:
                 if not item.likes and self.where == 'liked':
+                    g.stats.simple_event("vote.missing_votes_by_account")
                     return False
                 if item.likes is not False and self.where == 'disliked':
+                    g.stats.simple_event("vote.missing_votes_by_account")
                     return False
                 if self.where == 'saved' and not item.saved:
                     return False
@@ -806,6 +822,13 @@ class UserController(ListingController):
             sr_id = self.savedsr._id if self.savedsr else None
             q = queries.get_saved(self.vuser, sr_id,
                                   category=self.savedcategory)
+        elif self.where == 'actions':
+            self.check_modified(self.vuser, 'actions')
+            if not votes_visible(self.vuser):
+                q = queries.get_overview(self.vuser, self.sort, self.time)
+            else:
+                q = queries.get_user_actions(self.vuser, 'new', 'all')
+
         elif c.user_is_sponsor and self.where == 'promoted':
             q = queries.get_promoted_links(self.vuser._id)
 
@@ -841,9 +864,8 @@ class UserController(ListingController):
         if c.user_is_admin:
             c.referrer_policy = "always"
 
-        if self.sort in  ('hot', 'new'):
+        if self.sort in ('hot', 'new'):
             self.time = 'all'
-
 
         # hide spammers profile pages
         if vuser._spam and not vuser.banned_profile_visible:
@@ -856,7 +878,7 @@ class UserController(ListingController):
         if where in ('liked', 'disliked') and not votes_visible(vuser):
             return self.abort403()
 
-        if ((where in ('saved', 'hidden') or 
+        if ((where in ('saved', 'hidden') or
                 (where == 'gilded' and show == 'given')) and
                 not (c.user_is_loggedin and c.user._id == vuser._id) and
                 not c.user_is_admin):
@@ -1228,13 +1250,15 @@ class RedditsController(ListingController):
                                        sort = desc('_date'),
                                        write_cache = True,
                                        read_cache = True,
-                                       cache_time = 5 * 60)
+                                       cache_time = 5 * 60,
+                                       stale = True)
         else:
             reddits = None
             if self.where == 'new':
                 reddits = Subreddit._query( write_cache = True,
                                             read_cache = True,
-                                            cache_time = 5 * 60)
+                                            cache_time = 5 * 60,
+                                            stale = True)
                 reddits._sort = desc('_date')
             elif self.where == 'employee':
                 reddits = Subreddit._query(
@@ -1242,6 +1266,7 @@ class RedditsController(ListingController):
                     write_cache=True,
                     read_cache=True,
                     cache_time=5 * 60,
+                    stale=True,
                 )
                 reddits._sort = desc('_downs')
             elif self.where == 'gold':
@@ -1250,12 +1275,14 @@ class RedditsController(ListingController):
                     write_cache=True,
                     read_cache=True,
                     cache_time=5 * 60,
+                    stale=True,
                 )
                 reddits._sort = desc('_downs')
             else:
                 reddits = Subreddit._query( write_cache = True,
                                             read_cache = True,
-                                            cache_time = 60 * 60)
+                                            cache_time = 60 * 60,
+                                            stale = True)
                 reddits._sort = desc('_downs')
 
             if g.domain != 'reddit.com':
@@ -1320,7 +1347,8 @@ class MyredditsController(ListingController):
                                   #adding it's own date
                                   sort = (desc('_t1_ups'), desc('_t1_date')),
                                   eager_load = True,
-                                  thing_data = True)
+                                  thing_data = True,
+                                  thing_stale = True)
         reddits.prewrap_fn = lambda x: x._thing1
         return reddits
 

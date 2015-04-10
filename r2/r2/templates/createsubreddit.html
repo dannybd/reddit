@@ -23,6 +23,7 @@
 <%!
    from r2.config import feature
    from r2.lib.filters import keep_space
+   from r2.lib.menus import menu
    from r2.lib.pages import UserText
    from r2.lib.strings import strings
 %>
@@ -364,6 +365,17 @@ try participating in other communities on reddit for a little while first before
         %endif
         ${error_field("GOLD_ONLY_SR_REQUIRED", "hide_ads")}
       </ul>
+      %if feature.is_enabled('default_sort'):
+      <div class="usertext-edit">
+        <label for="suggested_comment_sort">${_('suggested comment sort')}&#32;<span class="gray">${_('(all comment threads will use this sorting method by default)')}</span></label>
+        <select class="nomargin" name="suggested_comment_sort" id="suggested_comment_sort">
+           <option value="">${_('none (recommended for most subreddits)')}</option>
+           %for sort in thing.comment_sorts:
+             <option ${'selected="selected"' if thing.site and sort == thing.site.suggested_comment_sort else ''} value="${sort}">${getattr(menu, sort, sort)}</option>
+           %endfor
+        </select>
+      </div>
+      %endif
     </div>
     <div class="usertext-edit">
       <div class="delete-field">
@@ -472,14 +484,77 @@ try participating in other communities on reddit for a little while first before
 %if thing.site:
   <%utils:line_field title="${_('related subreddits')}">
     <div class="delete-field">
-      <p class="little gray">${_('similar or related subreddits. one subreddit per line.')}</p>
-      <div class="usertext-edit">
-        <textarea name="related_subreddits" rows="1" cols="1">
-          ${keep_space(thing.site.related_subreddits)}
-        </textarea>
-        <span class="error BAD_SR_NAME field-related_subreddits" style="display:none"></span>
-        <span class="error TOO_MANY_SUBREDDITS field-related_subreddits" style="display:none"></span>
-      </div>
+      <p class="little gray">${_('similar or related subreddits.')}</p>
+      <ul id="related-srs" class="subreddits">
+        <li id="sr-template" style="display:none">
+          <a href=""></a>
+          <button class="remove-sr" onclick="remove_related_sr(this.parentNode)">${_('remove')}</button>
+        </li>
+        %for sr in thing.site.related_subreddits:
+          %if sr:
+            <li data-name="${sr.lower()}">
+              <a href="/r/${sr}">/r/${sr}</a>
+              <button class="remove-sr" onclick="remove_related_sr(this.parentNode)">${_('remove')}</button>
+            </li>
+          %endif
+        %endfor
+      </ul>
+      %if hasattr(thing, 'subreddit_selector'):
+      <form id="add-related-sr" onsubmit="return add_related_sr(this)">
+        ${thing.subreddit_selector}
+      </form>
+      %endif
+      <textarea id="related_subreddits" name="related_subreddits" style="display:none;">
+        ${keep_space('\n'.join(thing.site.related_subreddits))}
+      </textarea>
+      ${error_field("BAD_SR_NAME", "related_subreddits")}
+      ${error_field("TOO_MANY_SUBREDDITS", "related_subreddits")}
+      ${error_field("SUBREDDIT_NOEXIST", "related_subreddits")}
+      <script type="text/javascript">
+        function add_related_sr(form) {
+          $('.SUBREDDIT_NOEXIST.field-sr').hide();
+
+          var sr_name = form.sr.value.trim();
+          if (sr_name) {
+            $.post('/api/search_reddit_names.json', { query: sr_name, exact: true }, 'json')
+            .done(function(r) {
+              var sr_name = r.names[0];
+              var sr_path = '/r/' + sr_name;
+
+              var $sr_list = $('#related-srs');
+              var $sr_item = $sr_list.find('[data-name=' + sr_name.toLowerCase() + ']');
+              if (!$sr_item.length) {
+                $sr_item = $('#sr-template').clone().removeAttr('id');
+                $sr_item.data('name', sr_name.toLowerCase()).show();
+                $sr_item.find('a').attr('href', sr_path).text(sr_path);
+              }
+              $sr_item.appendTo($sr_list);
+
+              var re = new RegExp('(^|\n)' + sr_name + '(\n|$)', 'gim');
+              var $input = $('#related_subreddits');
+              $input.val($input.val().replace(re, '').trim() + '\n' + sr_name);
+
+              $('#sr-autocomplete').val('');
+            })
+            .fail(function() {
+              $('.SUBREDDIT_NOEXIST.field-sr').text(r._("that subreddit doesn't exist")).show();
+            });
+          }
+
+          return false;
+        }
+
+        function remove_related_sr(item) {
+          var $sr_item = $(item);
+          var sr_name = $sr_item.data('name');
+
+          $sr_item.remove();
+
+          var re = new RegExp('(^|\n)' + sr_name + '(\n|$)', 'gim');
+          var $input = $('#related_subreddits');
+          $input.val($input.val().replace(re, '\n').trim());
+        }
+      </script>
     </div>
   </%utils:line_field>
 %endif
@@ -506,7 +581,7 @@ try participating in other communities on reddit for a little while first before
         </%utils:image_upload>
       </li>
       <li>
-        <p><label>${_('banner image')}</label> <span class="gray">${_('banner should have 16:9 aspect ratio. PNG or JPG only.')}</span></p>
+        <p><label>${_('header image')}</label> <span class="gray">${_('header should have 16:9 aspect ratio. PNG or JPG only.')}</span></p>
         <p class="little gray">${_('minimum size: 640x360px')} / ${_('maximum size: 1280x720px')}</span></p>
         <%utils:image_upload post_target="/api/upload_sr_img"
                              current_image="${thing.site.banner_img}"
@@ -516,7 +591,7 @@ try participating in other communities on reddit for a little while first before
                     style="display: none;"
                   %endif
                   onclick="return post_form(this.form, 'delete_sr_banner');">
-            ${_('remove custom banner image')}
+            ${_('remove custom header image')}
           </button>
           <div class="clearleft"></div>
           <input type="hidden" name="uh" value="${c.modhash}">
@@ -525,7 +600,7 @@ try participating in other communities on reddit for a little while first before
         </%utils:image_upload>
       </li>
       <li>
-        <p><label>${_('color')}</label> <span class="gray">${_('used as a thematic color for your subreddit in the app')}</span></p>
+        <p><label>${_('color')}</label> <span class="gray">${_('used as a thematic color for your subreddit on mobile')}</span></p>
         <ul class="colors">
           %for color, color_name in thing.color_options.iteritems():
             %if color:
@@ -545,7 +620,7 @@ try participating in other communities on reddit for a little while first before
           <li class="custom-color">
             <% has_custom_color = c.site.key_color and c.site.key_color not in thing.color_options %>
             <label>
-              <p>${_('or pick a custom color:')}</p>
+              <p class="little">${_('or pick a custom color:')}</p>
               <input id="custom-color" type="radio" name="key_color" value=""
                      %if has_custom_color:
                        checked="checked"
@@ -630,11 +705,48 @@ try participating in other communities on reddit for a little while first before
     ${text}
   </button>
   &#32;
-  <span class="status error"></span>
+  <span class="status error" style="display:none"></span>
   ${error_field("RATELIMIT", "ratelimit")}
   ${error_field("CANT_CREATE_SR", "")}
   </div>
 </div>
 </div>
 
+%endif
+
+%if thing.site:
+<script type="text/javascript">
+(function(){
+  var dirty = {};
+
+  $(window).on('beforeunload', function(e) {
+    if ($('#sr-form .status:visible').length) {
+      return;
+    }
+    for (field in dirty) {
+      if (dirty[field]) {
+        return r._('There are unsaved changes. Are you sure you want to leave this page?');
+      }
+    }
+  });
+
+  $('#sr-form').on('change', function(e) {
+    var input = e.target;
+    if (input.tagName == 'SELECT') {
+      var $default = $('option[selected]', input);
+      var $current = $('option:selected', input);
+      dirty[input.name] = !$default.is($current);
+    } else if (input.type == 'checkbox' || input.type == 'radio') {
+      dirty[input.name] = input.checked ? !input.defaultChecked : input.defaultChecked;
+    } else if (input.type == 'file') {
+      /* ignore */
+    } else {
+      dirty[input.name] = input.value != input.defaultValue;
+    }
+    if (!dirty[input.name]) {
+      delete dirty[input.name];
+    }
+  });
+})();
+</script>
 %endif

@@ -155,6 +155,8 @@ python-kazoo
 python-stripe
 python-tinycss2
 python-unidecode
+python-mock
+python-yaml
 
 python-flask
 geoip-bin
@@ -311,6 +313,9 @@ if [ ! -f development.update ]; then
 # generate a new development.ini
 
 [DEFAULT]
+# global debug flag -- displays pylons stacktrace rather than 500 page on error when true
+# WARNING: a pylons stacktrace allows remote code execution. Make sure this is false
+# if your server is publicly accessible.
 debug = true
 
 disable_ads = true
@@ -740,6 +745,7 @@ set_consumer_count commentstree_q 1
 set_consumer_count newcomments_q 1
 set_consumer_count vote_link_q 1
 set_consumer_count vote_comment_q 1
+set_consumer_count automoderator_q 0
 
 chown -R $REDDIT_USER:$REDDIT_GROUP $CONSUMER_CONFIG_ROOT/
 

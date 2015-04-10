@@ -32,7 +32,7 @@
       context++;
     }
 
-    var query = 'embed=' + el.getAttribute('data-embed-token') +
+    var query = 'embed=true' +
                 '&context=' + context +
                 '&depth=' + (++context) +
                 '&showedits=' + (showedits === 'true') +
@@ -65,12 +65,13 @@
 
       App.addPostMessageOrigin(embed.getAttribute('data-embed-media'));
 
-      iframe.height = 0;
-      iframe.width = '100%';
+      iframe.height = iframe.style.height = 0;
+      iframe.width = iframe.style.width = '100%';
       iframe.scrolling = 'no';
       iframe.frameBorder = 0;
       iframe.allowTransparency = true;
       iframe.style.display = 'none';
+      iframe.style.maxWidth = '800px';
       iframe.style.minWidth = '220px';
       iframe.style.margin = '10px 0';
       iframe.style.borderRadius = '5px';
@@ -101,9 +102,8 @@
           return;
         }
 
-        iframe.height = (e.detail + 'px');
+        iframe.height = iframe.style.height = (e.detail + 'px');
       });
-
 
       embed.parentNode.insertBefore(iframe, embed);
     });

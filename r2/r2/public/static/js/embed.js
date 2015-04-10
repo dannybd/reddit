@@ -49,14 +49,13 @@
           '</label>' +
       '</h4>' +
       '<textarea class="c-form-control" id="embed-code" rows="3" readonly>' +
-          '<%= html %>' +
+          '<%- html %>' +
           '<%- scripts %>' +
       '</textarea>'
     );
 
     var embedCodeTemplate = _.template(
       '<div class="reddit-embed" ' +
-         ' data-embed-token="<%- token %>"' +
          ' data-embed-media="<%- media %>" ' +
          '<% if (parent) { %> data-embed-parent="true" <% } %>' +
          '<% if (live) { %> data-embed-live="true" <% } %>' +
@@ -175,8 +174,10 @@
         }
       });
 
-      $textarea.on('focus', function() {
-        $(this).select();
+      $textarea.on('focus', function(e) {
+        $(this).select().one('mouseup', function(e) {
+          e.preventDefault();
+        });
 
         if (!created) {
           var data = $el.data();

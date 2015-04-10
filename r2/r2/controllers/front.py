@@ -35,8 +35,9 @@ from r2.controllers.reddit_base import (
 from r2 import config
 from r2.models import *
 from r2.models.recommend import ExploreSettings
-from r2.config.extensions import is_api
-from r2.lib import hooks, recommender, embeds
+from r2.config import feature
+from r2.config.extensions import is_api, API_TYPES, RSS_TYPES
+from r2.lib import hooks, recommender, embeds, pages
 from r2.lib.pages import *
 from r2.lib.pages.things import hot_links_by_url_listing
 from r2.lib.pages import trafficpages
@@ -254,13 +255,23 @@ class FrontController(RedditController):
         # Determine if we should show the embed link for comments
         c.can_embed = feature.is_enabled("comment_embeds") and bool(comment)
 
-        embed_key = embeds.prepare_embed_request(sr)
+        is_embed = embeds.prepare_embed_request(sr)
 
         # check for 304
         self.check_modified(article, 'comments')
 
-        if embed_key:
-            embeds.set_up_embed(embed_key, sr, comment, showedits=showedits)
+        if is_embed:
+            embeds.set_up_embed(sr, comment, showedits=showedits)
+
+        # Temporary hook until IAMA app "OP filter" is moved from partners
+        # Not to be open-sourced
+        page = hooks.get_hook("comments_page.override").call_until_return(
+            controller=self,
+            article=article,
+            limit=limit,
+        )
+        if page:
+            return page
 
         # If there is a focal comment, communicate down to
         # comment_skeleton.html who that will be. Also, skip
@@ -354,22 +365,24 @@ class FrontController(RedditController):
 
         if previous_visits:
             displayPane.append(CommentVisitsBox(previous_visits))
-            # Used in later "more comments" renderings
-            pv_hex = md5(repr(previous_visits)).hexdigest()
-            g.cache.set(pv_hex, previous_visits, time=g.comment_visits_period)
-            c.previous_visits_hex = pv_hex
-
-        # Used in template_helpers
-        c.previous_visits = previous_visits
 
         if c.site.allows_referrers:
             c.referrer_policy = "always"
 
+        suggested_sort_active = False
+        suggested_sort = article.sort_if_suggested() if feature.is_enabled('default_sort') else None
         if article.contest_mode:
             if c.user_is_loggedin and sr.is_moderator(c.user):
-                sort = "top"
+                # Default to top for contest mode to make determining winners
+                # easier, but allow them to override it for moderation
+                # purposes.
+                if 'sort' not in request.params:
+                    sort = "top"
             else:
                 sort = "random"
+        elif suggested_sort and 'sort' not in request.params:
+            sort = suggested_sort
+            suggested_sort_active = True
 
         # finally add the comment listing
         displayPane.append(CommentPane(article, CommentSortMenu.operator(sort),
@@ -396,13 +409,24 @@ class FrontController(RedditController):
                 self._add_show_comments_link(subtitle_buttons, article, num,
                                              g.max_comments_gold, gold=True)
 
+        sort_menu = CommentSortMenu(
+            default=sort,
+            css_class='suggested' if suggested_sort_active else '',
+            suggested_sort=suggested_sort,
+        )
+
+        link_settings = LinkCommentsSettings(
+            article,
+            sort=sort,
+            suggested_sort=suggested_sort,
+        )
+
         res = LinkInfoPage(link=article, comment=comment,
                            content=displayPane,
                            page_classes=['comments-page'],
                            subtitle=subtitle,
                            subtitle_buttons=subtitle_buttons,
-                           nav_menus=[CommentSortMenu(default=sort),
-                                        LinkCommentsSettings(article)],
+                           nav_menus=[sort_menu, link_settings],
                            infotext=infotext).render()
         return res
 
@@ -541,6 +565,16 @@ class FrontController(RedditController):
             mod = mods[mod_id]
             mod_buttons.append(QueryButton(mod.name, mod.name,
                                            query_param='mod'))
+        # add a choice for the automoderator account if it's not a mod
+        if (g.automoderator_account and
+                all(mod.name != g.automoderator_account
+                    for mod in mods.values())):
+            automod_button = QueryButton(
+                g.automoderator_account,
+                g.automoderator_account,
+                query_param="mod",
+            )
+            mod_buttons.append(automod_button)
         mod_buttons.append(QueryButton(_('admins*'), 'a', query_param='mod'))
         base_path = request.path
         menus = [NavMenu(action_buttons, base_path=base_path,
@@ -871,7 +905,15 @@ class FrontController(RedditController):
     @api_doc(api_section.subreddits, uri='/subreddits/search', supports_rss=True)
     def GET_search_reddits(self, query, reverse, after, count, num):
         """Search subreddits by title and description."""
-        q = SubredditSearchQuery(query)
+        # show NSFW to API and RSS users unless obey_over18=true
+        is_api_or_rss = (c.render_style in API_TYPES
+                         or c.render_style in RSS_TYPES)
+        if is_api_or_rss and c.obey_over18 and not c.over18:
+            include_over18 = False
+        else:
+            include_over18 = True
+
+        q = SubredditSearchQuery(query, include_over18=include_over18)
 
         results, etime, spane = self._search(q, num=num, reverse=reverse,
                                              after=after, count=count,
@@ -912,10 +954,19 @@ class FrontController(RedditController):
         if not syntax:
             syntax = SearchQuery.default_syntax
 
+        # show NSFW to API and RSS users unless obey_over18=true
+        is_api_or_rss = (c.render_style in API_TYPES
+                         or c.render_style in RSS_TYPES)
+        if is_api_or_rss and c.obey_over18 and not c.over18:
+            include_over18 = False
+        else:
+            include_over18 = True
+
         try:
             cleanup_message = None
             try:
-                q = SearchQuery(query, site, sort,
+                q = SearchQuery(query, site, sort=sort,
+                                include_over18=include_over18,
                                 recent=recent, syntax=syntax)
                 results, etime, spane = self._search(q, num=num, after=after,
                                                      reverse=reverse,
@@ -928,7 +979,9 @@ class FrontController(RedditController):
                 cleaned = re.sub("[^\w\s]+", " ", query)
                 cleaned = cleaned.lower().strip()
 
-                q = SearchQuery(cleaned, site, sort, recent=recent)
+                q = SearchQuery(cleaned, site, sort=sort,
+                                include_over18=include_over18,
+                                recent=recent)
                 results, etime, spane = self._search(q, num=num,
                                                      after=after,
                                                      reverse=reverse,
@@ -1206,7 +1259,9 @@ class FrontController(RedditController):
         return BoringPage(_("thanks"), show_sidebar=False,
                           content=GoldThanks(claim_msg=claim_msg,
                                              vendor_url=vendor_url,
-                                             lounge_md=lounge_md)).render()
+                                             lounge_md=lounge_md),
+                          page_classes=["gold-page-ga-tracking"]
+                         ).render()
 
     @validate(VUser(),
               token=VOneTimeToken(AwardClaimToken, "code"))
@@ -1561,7 +1616,9 @@ class FormsController(RedditController):
 
         return BoringPage(_("reddit gold"),
                           show_sidebar=False,
-                          content=content).render()
+                          content=content,
+                          page_classes=["gold-page-ga-tracking"]
+                         ).render()
 
     @validate(is_payment=VBoolean("is_payment"),
               goldtype=VOneOf("goldtype",
@@ -1650,7 +1707,7 @@ class FormsController(RedditController):
                                            giftmessage,
                                            can_subscribe=can_subscribe,
                                            edit=edit),
-                              page_classes=["gold-page", "gold-signup"],
+                              page_classes=["gold-page", "gold-signup", "gold-page-ga-tracking"],
                               ).render()
         else:
             # If we have a validating form, and we're not yet on the payment
@@ -1678,7 +1735,7 @@ class FormsController(RedditController):
 
             passthrough = generate_blob(payment_blob)
 
-            page_classes = ["gold-page", "gold-payment"]
+            page_classes = ["gold-page", "gold-payment", "gold-page-ga-tracking"]
             if goldtype == "creddits":
                 page_classes.append("creddits-payment")
 
@@ -1695,12 +1752,19 @@ class FormsController(RedditController):
         return BoringPage(_("purchase creddits"),
                           show_sidebar=False,
                           content=Creddits(),
-                          page_classes=["gold-page", "creddits-purchase"],
+                          page_classes=["gold-page", "creddits-purchase", "gold-page-ga-tracking"],
                           ).render()
 
     @validate(VUser())
     def GET_subscription(self):
         user = c.user
         content = GoldSubscription(user)
-        return BoringPage(_("reddit gold subscription"), show_sidebar=False,
-                          content=content).render()
+        return BoringPage(_("reddit gold subscription"),
+                          show_sidebar=False,
+                          content=content,
+                          page_classes=["gold-page-ga-tracking"]
+                         ).render()
+
+
+class FrontUnstyledController(FrontController):
+    allow_stylesheets = False

@@ -21,11 +21,12 @@
 ###############################################################################
 
 from r2.models import Account, Link, Comment, Report, LinksByAccount
-from r2.models.vote import cast_vote, get_votes
+from r2.models.vote import cast_vote, get_votes, VotesByAccount
 from r2.models import Message, Inbox, Subreddit, ModContribSR, ModeratorInbox, MultiReddit
 from r2.lib.db.thing import Thing, Merge
 from r2.lib.db.operators import asc, desc, timeago
 from r2.lib.db.sorts import epoch_seconds
+from r2.lib.db import tdb_cassandra
 from r2.lib.utils import fetch_things2, tup, UniqueIterator, set_last_modified
 from r2.lib import utils
 from r2.lib import amqp, sup, filters
@@ -112,18 +113,18 @@ class CachedResults(object):
     def sort(self):
         return self.query._sort
 
-    def fetch(self, force=False):
+    def fetch(self, force=False, stale=False):
         """Loads the query from the cache."""
-        self.fetch_multi([self], force=force)
+        self.fetch_multi([self], force=force, stale=stale)
 
     @classmethod
-    def fetch_multi(cls, crs, force=False):
+    def fetch_multi(cls, crs, force=False, stale=False):
         unfetched = filter(lambda cr: force or not cr._fetched, crs)
         if not unfetched:
             return
 
-        cached = query_cache.get_multi([cr.iden for cr in unfetched],
-                                       allow_local = not force)
+        keys = [cr.iden for cr in unfetched]
+        cached = query_cache.get_multi(keys, allow_local=not force, stale=stale)
         for cr in unfetched:
             cr.data = cached.get(cr.iden) or []
             cr._fetched = True
@@ -526,6 +527,11 @@ def _get_submitted(user_id, sort, time):
 
 def get_submitted(user, sort, time):
     return _get_submitted(user._id, sort, time)
+
+def get_user_actions(user, sort, time):
+    return merge_results(get_comments(user, sort, time),
+                         get_submitted(user, sort, time),
+                         get_liked(user))
 
 def get_overview(user, sort, time):
     return merge_results(get_comments(user, sort, time),
@@ -1267,22 +1273,6 @@ def unnotify(thing, possible_recipients=None):
         raise ValueError("Unable to unnotify thing of type: %r" % thing)
 
 
-def changed(things, boost_only=False):
-    """Indicate to search that `things` should be updated in the index"""
-    for thing in tup(things):
-        changed_fullname(thing._fullname, boost_only)
-
-
-def changed_fullname(fullname, boost_only=False):
-    msg = {'fullname': fullname}
-    if boost_only:
-        msg['boost_only'] = True
-
-    amqp.add_item('search_changes', pickle.dumps(msg),
-                  message_id=fullname,
-                  delivery_mode=amqp.DELIVERY_TRANSIENT)
-
-
 def _by_srid(things, srs=True):
     """Takes a list of things and returns them in a dict separated by
        sr_id, in addition to the looked-up subreddits"""
@@ -1378,7 +1368,9 @@ def delete(things):
             m.insert(q, inserts)
         for q, deletes in query_cache_deletes:
             m.delete(q, deletes)
-    changed(things)
+
+    for thing in tup(things):
+        thing.update_search_index()
 
 
 def edit(thing):
@@ -1443,7 +1435,9 @@ def ban(things, filtered=True):
             m.insert(q, inserts)
         for q, deletes in query_cache_deletes:
             m.delete(q, deletes)
-    changed(things)
+
+    for thing in tup(things):
+        thing.update_search_index()
 
 
 def _common_del_ban(things):
@@ -1522,7 +1516,8 @@ def unban(things, insert=True):
         for q, deletes in query_cache_deletes:
             m.delete(q, deletes)
 
-    changed(things)
+    for thing in tup(things):
+        thing.update_search_index()
 
 def new_report(thing, report_rel):
     reporter_id = report_rel._thing1_id
@@ -1536,6 +1531,8 @@ def new_report(thing, report_rel):
             m.insert(get_user_reported_comments(reporter_id), [report_rel])
         elif isinstance(thing, Message):
             m.insert(get_user_reported_messages(reporter_id), [report_rel])
+
+    amqp.add_item("new_report", thing._fullname)
 
 
 def clear_reports(things, rels):
@@ -1663,11 +1660,20 @@ vote_link_q = 'vote_link_q'
 vote_comment_q = 'vote_comment_q'
 vote_fastlane_q = 'vote_fastlane_q'
 
+vote_names_by_dir = {True: "1", None: "0", False: "-1"}
+vote_dirs_by_name = {v: k for k, v in vote_names_by_dir.iteritems()}
+
 def queue_vote(user, thing, dir, ip, vote_info=None,
                cheater = False, store = True):
     # set the vote in memcached so the UI gets updated immediately
     key = prequeued_vote_key(user, thing)
-    g.cache.set(key, '1' if dir is True else '0' if dir is None else '-1')
+    grace_period = int(g.vote_queue_grace_period.total_seconds())
+    g.cache.set(key, vote_names_by_dir[dir], time=grace_period+1)
+
+    # update LastModified immediately to help us cull prequeued_vote lookups
+    rel_cls = VotesByAccount.rel(user.__class__, thing.__class__)
+    LastModified.touch(user._fullname, rel_cls._last_modified_name)
+
     # queue the vote to be stored unless told not to
     if store:
         if isinstance(thing, Link):
@@ -1696,32 +1702,72 @@ def queue_vote(user, thing, dir, ip, vote_info=None,
 def prequeued_vote_key(user, item):
     return 'registered_vote_%s_%s' % (user._id, item._fullname)
 
-def get_likes(user, items):
-    if not user or not items:
+
+def _by_type(items):
+    by_type = collections.defaultdict(list)
+    for item in items:
+        by_type[item.__class__].append(item)
+    return by_type
+
+
+def get_likes(user, requested_items):
+    if not user or not requested_items:
         return {}
 
     res = {}
 
-    # check the prequeued_vote_keys
-    keys = {}
-    for item in items:
-        # we can only vote on links and comments
-        if isinstance(item, (Comment, Link)):
-            key = prequeued_vote_key(user, item)
-            keys[key] = (user, item)
+    try:
+        last_modified = LastModified._byID(user._fullname)
+    except tdb_cassandra.NotFound:
+        last_modified = None
+
+    items_in_grace_period = {}
+    items_by_type = _by_type(requested_items)
+    for type_, items in items_by_type.iteritems():
+        try:
+            rel_cls = VotesByAccount.rel(user.__class__, type_)
+        except tdb_cassandra.TdbException:
+            # these items can't be voted on. just mark 'em as None and skip.
+            for item in items:
+                res[(user, item)] = None
+            continue
+
+        last_vote = getattr(last_modified, rel_cls._last_modified_name, None)
+        if last_vote:
+            time_since_last_vote = datetime.now(pytz.UTC) - last_vote
+
+        # only do prequeued_vote lookups if we've voted within the grace period
+        # and therefore might have votes in flight in the queues.
+        if last_vote and time_since_last_vote < g.vote_queue_grace_period:
+            too_new = 0
+
+            for item in items:
+                if item._age > time_since_last_vote:
+                    key = prequeued_vote_key(user, item)
+                    items_in_grace_period[key] = (user, item)
+                else:
+                    # the item is newer than our last vote, we can't have
+                    # possibly voted on it.
+                    res[(user, item)] = None
+                    too_new += 1
+
+            if too_new:
+                g.stats.simple_event("vote.prequeued.too-new", delta=too_new)
         else:
-            res[(user, item)] = None
-    if keys:
-        g.stats.simple_event("vote.prequeued.fetch", delta=len(keys))
-        r = g.cache.get_multi(keys.keys())
+            g.stats.simple_event("vote.prequeued.graceless", delta=len(items))
+
+    # look up votes in memcache for items that could have been voted on
+    # but not processed by a queue processor yet.
+    if items_in_grace_period:
+        g.stats.simple_event(
+            "vote.prequeued.fetch", delta=len(items_in_grace_period))
+        r = g.cache.get_multi(items_in_grace_period.keys())
         for key, v in r.iteritems():
-            res[keys[key]] = (True if v == '1'
-                              else False if v == '-1'
-                              else None)
+            res[items_in_grace_period[key]] = vote_dirs_by_name[v]
 
-    likes = get_votes(user, [i for i in items if (user, i) not in res])
-
-    res.update(likes)
+    cassavotes = get_votes(
+        user, [i for i in requested_items if (user, i) not in res])
+    res.update(cassavotes)
 
     return res
 
@@ -1845,6 +1891,9 @@ def consume_deleted_accounts():
         # Mark their link submissions for updating on cloudsearch
         query = LinksByAccount._cf.xget(account._id36)
         for link_id36, unused in query:
-            changed_fullname(Link._fullname_from_id36(link_id36))
+            fullname = Link._fullname_from_id36(link_id36)
+            msg = pickle.dumps({"fullname": fullname})
+            amqp.add_item("search_changes", msg, message_id=fullname,
+                delivery_mode=amqp.DELIVERY_TRANSIENT)
 
     amqp.consume_items('del_account_q', process_deleted_accounts)

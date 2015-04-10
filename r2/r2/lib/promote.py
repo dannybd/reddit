@@ -196,6 +196,9 @@ def add_trackers(items, sr):
             "r": random.randint(0, 2147483647), # cachebuster
         }
         item.imp_pixel = update_query(g.adtracker_url, pixel_query)
+        
+        if item.third_party_tracking:
+            item.third_party_tracking_url = item.third_party_tracking
 
         # construct the click redirect url
         url = urllib.unquote(item.url.encode("utf-8"))
@@ -860,9 +863,15 @@ def srnames_with_live_promos(user, site):
     return promo_srnames.intersection(site_srnames)
 
 
-def _get_live_promotions(sr_names):
+# special handling for memcache ascii protocol
+SPECIAL_NAMES = {" reddit.com": "_reddit.com"}
+REVERSED_NAMES = {v: k for k, v in SPECIAL_NAMES.iteritems()}
+
+
+def _get_live_promotions(sanitized_names):
     now = promo_datetime_now()
-    ret = {sr_name: [] for sr_name in sr_names}
+    sr_names = [REVERSED_NAMES.get(name, name) for name in sanitized_names]
+    ret = {sr_name: [] for sr_name in sanitized_names}
     for camp, link in get_promos(now, sr_names=sr_names):
         if is_live_promo(link, camp):
             weight = (camp.bid / camp.ndays)
@@ -870,13 +879,20 @@ def _get_live_promotions(sr_names):
                             campaign=camp._fullname)
             for sr_name in camp.target.subreddit_names:
                 if sr_name in sr_names:
-                    ret[sr_name].append(pt)
+                    sanitized_name = SPECIAL_NAMES.get(sr_name, sr_name)
+                    ret[sanitized_name].append(pt)
     return ret
 
 
 def get_live_promotions(sr_names):
-    promos_by_srname = sgm(g.cache, sr_names, miss_fn=_get_live_promotions,
-                           prefix='live_promotions', time=60)
+    sanitized_names = [SPECIAL_NAMES.get(name, name) for name in sr_names]
+    promos_by_sanitized_name = sgm(
+        g.cache, sanitized_names, miss_fn=_get_live_promotions,
+        prefix='live_promotions', time=60, stale=True)
+    promos_by_srname = {
+        REVERSED_NAMES.get(name, name): val
+        for name, val in promos_by_sanitized_name.iteritems()
+    }
     return itertools.chain.from_iterable(promos_by_srname.itervalues())
 
 

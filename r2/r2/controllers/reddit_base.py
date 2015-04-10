@@ -46,7 +46,6 @@ from pylons.i18n.translation import LanguageError
 from r2.config import feature
 from r2.config.extensions import is_api, set_extension
 from r2.lib import filters, pages, utils, hooks, ratelimit
-from r2.lib.authentication import authenticate_user
 from r2.lib.base import BaseController, abort
 from r2.lib.cache import make_key, MemcachedError
 from r2.lib.errors import (
@@ -75,7 +74,6 @@ from r2.lib.utils import (
 )
 from r2.lib.validator import (
     build_arg_list,
-    chksrname,
     fullname_regex,
     valid_jsonp_callback,
     validate,
@@ -367,8 +365,9 @@ def set_subreddit():
         #reddits
         c.site = Sub
     elif '+' in sr_name:
-        sr_names = filter(lambda name: chksrname(name, allow_language_srs=True,
-            allow_special_srs=True), sr_name.split('+'))
+        name_filter = lambda name: Subreddit.is_valid_name(name,
+            allow_language_srs=True)
+        sr_names = filter(name_filter, sr_name.split('+'))
         srs = Subreddit._by_name(sr_names, stale=can_stale).values()
         if All in srs:
             c.site = All
@@ -411,8 +410,7 @@ def set_subreddit():
         try:
             c.site = Subreddit._by_name(sr_name, stale=can_stale)
         except NotFound:
-            sr_name = chksrname(sr_name)
-            if sr_name:
+            if Subreddit.is_valid_name(sr_name):
                 path = "/subreddits/search?q=%s" % sr_name
                 abort(302, location=BaseController.format_output_url(path))
             elif not c.error_page and not request.path.startswith("/api/login/") :
@@ -439,17 +437,14 @@ def set_subreddit():
 _FILTER_SRS = {"mod": ModFiltered, "all": AllFiltered}
 def set_multireddit():
     routes_dict = request.environ["pylons.routes_dict"]
-    if "multipath" in routes_dict:
-        fullpath = routes_dict["multipath"].lower()
+    if "multipath" in routes_dict or ("m" in request.GET and is_api()):
+        fullpath = routes_dict.get("multipath", "").lower()
         multipaths = fullpath.split("+")
         multi_ids = None
-        username = None
-        logged_in_username = None
+        logged_in_username = c.user.name.lower() if c.user_is_loggedin else None
         multiurl = None
 
         if c.user_is_loggedin and routes_dict.get("my_multi"):
-            logged_in_username = c.user.name.lower()
-            username = logged_in_username
             multi_ids = ["/user/%s/m/%s" % (logged_in_username, multipath)
                          for multipath in multipaths]
             multiurl = "/me/m/" + fullpath
@@ -457,7 +452,6 @@ def set_multireddit():
             username = routes_dict["username"].lower()
 
             if c.user_is_loggedin:
-                logged_in_username = c.user.name.lower()
                 # redirect /user/foo/m/... to /me/m/... for user foo.
                 if username == logged_in_username and not is_api():
                     # trim off multi id
@@ -469,6 +463,22 @@ def set_multireddit():
             multiurl = "/user/" + username + "/m/" + fullpath
             multi_ids = ["/user/%s/m/%s" % (username, multipath)
                         for multipath in multipaths]
+        elif 'sr_multi' in routes_dict:
+            if isinstance(c.site, FakeSubreddit):
+                abort(404)
+            if (not is_api() and
+                     not feature.is_enabled('multireddit_customizations')):
+                abort(404)
+
+            multiurl = "/r/" + c.site.name.lower() + "/m/" + fullpath
+            multi_ids = ["/r/%s/m/%s" % (c.site.name.lower(), multipath)
+                        for multipath in multipaths]
+        elif "m" in request.GET and is_api():
+            # Only supported via API as we don't have a valid non-query
+            # parameter equivalent for cross-user multis, which means
+            # we can't generate proper links to /new, /top, etc in HTML
+            multi_ids = [m.lower() for m in request.GET.getall("m")]
+            multiurl = ""
 
         if multi_ids is not None:
             multis = LabeledMulti._byID(multi_ids, return_dict=False) or []
@@ -478,14 +488,18 @@ def set_multireddit():
             elif len(multis) == 1:
                 c.site = multis[0]
             else:
-                srs = Subreddit.random_reddits(
+                sr_ids = Subreddit.random_reddits(
                     logged_in_username,
                     list(set(itertools.chain.from_iterable(
-                        multi.srs for multi in multis
+                        multi.sr_ids for multi in multis
                     ))),
-                    LabeledMulti.MAX_SR_COUNT
+                    LabeledMulti.MAX_SR_COUNT,
                 )
+                srs = Subreddit._byID(sr_ids, data=True, return_dict=False)
                 c.site = MultiReddit(multiurl, srs)
+                if any(m.weighting_scheme == "fresh" for m in multis):
+                    c.site.weighting_scheme = "fresh"
+
     elif "filtername" in routes_dict:
         if not c.user_is_loggedin:
             abort(404)
@@ -1178,10 +1192,6 @@ class MinimalController(BaseController):
             wrapped_content = c.response_wrapper(content)
             response.content = wrapped_content
 
-        if c.user_is_loggedin:
-            response.headers['Cache-Control'] = 'no-cache'
-            response.headers['Pragma'] = 'no-cache'
-
         # pagecache stores headers. we need to not add X-Frame-Options to
         # cached requests (such as media embeds) that intend to allow framing.
         if not c.allow_framing and not c.used_cache:
@@ -1194,6 +1204,10 @@ class MinimalController(BaseController):
         # Don't poison the cache with uncacheable cookies
         dirty_cookies = (k for k, v in c.cookies.iteritems() if v.dirty)
         would_poison = any((k not in CACHEABLE_COOKIES) for k in dirty_cookies)
+
+        if c.user_is_loggedin or would_poison:
+            response.headers['Cache-Control'] = 'no-cache'
+            response.headers['Pragma'] = 'no-cache'
 
         # save the result of this page to the pagecache if possible.  we
         # mustn't cache things that rely on state not tracked by request_key
@@ -1419,6 +1433,27 @@ class OAuth2ResourceController(MinimalController):
         c.user_special_distinguish = c.user.special_distinguish()
 
 
+class OAuth2OnlyController(OAuth2ResourceController):
+    """Base controller for endpoints that may only be accessed via OAuth 2"""
+
+    # OAuth2 doesn't rely on ambient credentials for authentication,
+    # so CSRF prevention is unnecessary.
+    handles_csrf = True
+
+    def pre(self):
+        OAuth2ResourceController.pre(self)
+        if request.method != "OPTIONS":
+            self.authenticate_with_token()
+            self.set_up_user_context()
+            self.run_sitewide_ratelimits()
+
+    def can_use_pagecache(self):
+        return False
+
+    def on_validation_error(self, error):
+        abort_with_error(error, error.code or 400)
+
+
 class RedditController(OAuth2ResourceController):
 
     @staticmethod
@@ -1504,7 +1539,14 @@ class RedditController(OAuth2ResourceController):
         # no logins for RSS feed unless valid_feed has already been called
         if not c.user:
             if c.extension != "rss":
-                authenticate_user()
+                if not g.read_only_mode:
+                    c.user = g.auth_provider.get_authenticated_account()
+
+                    if c.user and c.user._deleted:
+                        c.user = None
+                else:
+                    c.user = None
+                c.user_is_loggedin = bool(c.user)
 
                 admin_cookie = c.cookies.get(g.admin_cookie)
                 if c.user_is_loggedin and admin_cookie:
@@ -1596,7 +1638,10 @@ class RedditController(OAuth2ResourceController):
                 self.abort404()
 
             # check if the user has access to this subreddit
-            if not c.site.can_view(c.user) and not c.error_page:
+            # Allow OPTIONS requests through, as no response body
+            # is sent in those cases - just a set of headers
+            if (not c.site.can_view(c.user) and not c.error_page and
+                    request.method != "OPTIONS"):
                 if isinstance(c.site, LabeledMulti):
                     # do not leak the existence of multis via 403.
                     self.abort404()
@@ -1649,7 +1694,8 @@ class RedditController(OAuth2ResourceController):
 
     def post(self):
         MinimalController.post(self)
-        self._embed_html_timing_data()
+        if response.content_type == "text/html":
+            self._embed_html_timing_data()
 
         # allow logged-out JSON requests to be read cross-domain
         if (not c.cors_checked and request.method.upper() == "GET" and

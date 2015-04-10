@@ -23,6 +23,7 @@
 import cgi
 import json
 from collections import OrderedDict
+from decimal import Decimal
 
 from pylons import c, g, request, response
 from pylons.i18n import _
@@ -341,7 +342,7 @@ def validatedMultipartForm(self, self_method, responder, simple_vals,
                           param_vals, *a, **kw)
 
 
-jsonp_callback_rx = re.compile(r"""\A[\w$\."'[\]]+\Z""")
+jsonp_callback_rx = re.compile("\\A[\\w$\\.\"'[\\]]+\\Z")
 def valid_jsonp_callback(callback):
     return jsonp_callback_rx.match(callback)
 
@@ -527,26 +528,6 @@ class VCssMeasure(Validator):
     def run(self, value):
         return value if value and self.measure.match(value) else ''
 
-subreddit_rx = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_]{2,20}\Z")
-language_subreddit_rx = re.compile(r"\A[a-z]{2}\Z")
-
-def chksrname(x, allow_language_srs=False, allow_special_srs=False):
-    if not x:
-        return None
-
-    #notice the space before reddit.com
-    if not allow_special_srs and x in ('friends', 'all', ' reddit.com'):
-        return False
-
-    try:
-        valid = subreddit_rx.match(x)
-        if allow_language_srs:
-            valid = valid or language_subreddit_rx.match(x)
-
-        return str(x) if valid else None
-    except UnicodeEncodeError:
-        return None
-
 
 class VLength(Validator):
     only_whitespace = re.compile(r"\A\s*\Z", re.UNICODE)
@@ -707,10 +688,11 @@ class VSubredditName(VRequired):
         self.allow_language_srs = allow_language_srs
 
     def run(self, name):
-        name = chksrname(name, self.allow_language_srs)
-        if not name:
+        valid_name = Subreddit.is_valid_name(
+            name, allow_language_srs=self.allow_language_srs)
+        if not valid_name:
             self.set_error(self._error, code=400)
-        return name
+        return str(name)
 
     def param_docs(self):
         return {
@@ -924,12 +906,28 @@ class VCaptcha(Validator):
 
 
 class VUser(Validator):
-    def run(self, password = None):
+    def run(self):
         if not c.user_is_loggedin:
             raise UserRequiredException
 
-        if (password is not None) and not valid_password(c.user, password):
+
+class VVerifyPassword(Validator):
+    def __init__(self, param, fatal=True, *a, **kw):
+        Validator.__init__(self, param, *a, **kw)
+        self.fatal = fatal
+
+    def run(self, password):
+        VUser().run()
+        if not valid_password(c.user, password):
+            if self.fatal:
+                abort(403)
             self.set_error(errors.WRONG_PASSWORD)
+
+    def param_docs(self):
+        return {
+            self.param: "the current user's password",
+        }
+
 
 class VModhash(Validator):
     handles_csrf = True
@@ -1707,9 +1705,16 @@ class VInt(VNumber):
 
         return {self.param: description}
 
+
 class VFloat(VNumber):
     def cast(self, val):
         return float(val)
+
+
+class VDecimal(VNumber):
+    def cast(self, val):
+        return Decimal(val)
+
 
 class VCssName(Validator):
     """
@@ -2222,7 +2227,7 @@ class VDestination(Validator):
         if ld.startswith(('/', 'http://', 'https://')):
             u = UrlParser(dest)
 
-            if u.is_reddit_url(c.site):
+            if u.is_reddit_url(c.site) and u.is_web_safe_url():
                 return dest
 
         ip = getattr(request, "ip", "[unknown]")
@@ -2697,11 +2702,14 @@ class VMultiPath(Validator):
         try:
             require(path)
             path = self.normalize(path)
-            require(path.startswith('/user/'))
-            user, username, kind, name = require_split(path, 5, sep='/')[1:]
+            require(path.startswith('/user/') or path.startswith('/r/'))
+            prefix, owner, kind, name = require_split(path, 5, sep='/')[1:]
             require(kind in self.kinds)
-            username = chkuser(username)
-            require(username)
+            if prefix == 'r':
+                owner = owner if Subreddit.is_valid_name(owner) else None
+            else:
+                owner = chkuser(owner)
+            require(owner)
         except RequirementException:
             self.set_error('BAD_MULTI_PATH', code=400)
             return
@@ -2728,7 +2736,7 @@ class VMultiPath(Validator):
             self.set_error('BAD_MULTI_NAME', {'reason': reason}, code=400)
             return
 
-        return {'path': path, 'username': username, 'name': name}
+        return {'path': path, 'prefix': prefix, 'owner': owner, 'name': name}
 
     def param_docs(self):
         return {
@@ -2774,24 +2782,31 @@ class VSubredditList(Validator):
 
     def run(self, subreddits):
         if not subreddits:
-            return ''
+            return []
 
         # extract subreddit name if path provided
         subreddits = [sr_path_rx.sub('\g<name>', sr.strip())
-                      for sr in subreddits.lower().splitlines()]
+                      for sr in subreddits.lower().strip().splitlines() if sr]
 
         for name in subreddits:
-            if name and not chksrname(name, self.allow_language_srs):
+            valid_name = Subreddit.is_valid_name(
+                name, allow_language_srs=self.allow_language_srs)
+            if not valid_name:
                 return self.set_error(errors.BAD_SR_NAME, code=400)
 
-        # unique nonempty subreddits, preserve order
-        subreddits = list(OrderedDict.fromkeys([''] + subreddits))[1:]
+        unique_srs = set(subreddits)
 
-        if len(subreddits) > self.limit:
+        if subreddits:
+            valid_srs = set(Subreddit._by_name(subreddits).keys())
+            if unique_srs - valid_srs:
+                return self.set_error(errors.SUBREDDIT_NOEXIST, code=400)
+
+        if len(unique_srs) > self.limit:
             return self.set_error(
                 errors.TOO_MANY_SUBREDDITS, {'max': self.limit}, code=400)
 
-        return '\n'.join(subreddits)
+        # return list of subreddit names as entered
+        return subreddits
 
     def param_docs(self):
         return {

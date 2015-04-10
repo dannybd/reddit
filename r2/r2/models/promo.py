@@ -28,7 +28,6 @@ from pylons import g, c
 from pylons.i18n import _, N_
 
 from r2.lib import filters
-from r2.lib.cache import sgm
 from r2.lib.db import tdb_cassandra
 from r2.lib.db.thing import Thing, NotFound
 from r2.lib.memoize import memoize
@@ -162,8 +161,9 @@ NO_TRANSACTION = 0
 
 
 class Collection(object):
-    def __init__(self, name, sr_names, description=None):
+    def __init__(self, name, sr_names, over_18=False, description=None):
         self.name = name
+        self.over_18 = over_18
         self.sr_names = sr_names
         self.description = description
 
@@ -193,11 +193,32 @@ class CollectionStorage(tdb_cassandra.View):
     SR_NAMES_DELIM = '|'
 
     @classmethod
-    def set(cls, name, description, srs):
-        rowkey = name
+    def _from_columns(cls, name, columns):
+        description = columns['description']
+        sr_names = columns['sr_names'].split(cls.SR_NAMES_DELIM)
+        over_18 = bool(columns.get("over_18", "False"))
+        return Collection(name, sr_names, over_18=over_18, description=description)
+
+    @classmethod
+    def _to_columns(cls, description, srs, over_18):
         columns = {
             'description': description,
             'sr_names': cls.SR_NAMES_DELIM.join(sr.name for sr in srs),
+            'over_18': str(over_18),
+        }
+        return columns
+
+    @classmethod
+    def set(cls, name, description, srs, over_18):
+        rowkey = name
+        columns = cls._to_columns(description, srs, over_18)
+        cls._set_values(rowkey, columns)
+
+    @classmethod
+    def set_over_18(cls, name, over_18):
+        rowkey = name
+        columns = {
+            'over_18': str(over_18),
         }
         cls._set_values(rowkey, columns)
 
@@ -212,17 +233,13 @@ class CollectionStorage(tdb_cassandra.View):
         except tdb_cassandra.NotFoundException:
             return None
 
-        description = columns['description']
-        sr_names = columns['sr_names'].split(cls.SR_NAMES_DELIM)
-        return Collection(name, sr_names, description=description)
+        return cls._from_columns(name, columns)
 
     @classmethod
     def get_all(cls):
         ret = []
         for name, columns in cls._cf.get_range():
-            description = columns['description']
-            sr_names = columns['sr_names'].split(cls.SR_NAMES_DELIM)
-            ret.append(Collection(name, sr_names, description=description))
+            ret.append(cls._from_columns(name, columns))
         return ret
 
     def delete(cls, name):

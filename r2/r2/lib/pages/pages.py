@@ -272,6 +272,10 @@ class Reddit(Templated):
             if g.domain_prefix:
                 u.hostname = "%s.%s" % (g.domain_prefix, u.hostname)
             self.canonical_link = u.unparse()
+        # Generate a mobile link for Google.
+        u = UrlParser(request.fullpath)
+        u.switch_subdomain_by_extension('compact')
+        self.mobile_link = u.unparse()
 
         if self.show_infobar:
             if not infotext:
@@ -509,7 +513,7 @@ class Reddit(Templated):
 
         if isinstance(c.site, (MultiReddit, ModSR)):
             srs = Subreddit._byID(c.site.sr_ids, data=True,
-                                  return_dict=False)
+                                  return_dict=False, stale=True)
 
             if (srs and c.user_is_loggedin and
                     (c.user_is_admin or c.site.is_moderator(c.user))):
@@ -633,6 +637,12 @@ class Reddit(Templated):
                            '/subreddits/create', 'create',
                            subtitles = rand_strings.get("create_reddit", 2),
                            show_cover = True, nocname=True))
+
+        if c.default_sr:
+            hook = hooks.get_hook('home.add_sidebox')
+            extra_sidebox = hook.call_until_return()
+            if extra_sidebox:
+                ps.append(extra_sidebox)
 
         if not isinstance(c.site, FakeSubreddit) and not c.cname:
             moderators = self.sr_moderators()
@@ -791,6 +801,9 @@ class Reddit(Templated):
             self.welcomebar, self.infobar, self.locationbar, self.nav_menu,
             self._content))
 
+    def is_gold_page(self):
+        return "gold-page-ga-tracking" in self.supplied_page_classes
+
     def page_classes(self):
         classes = set()
 
@@ -866,10 +879,10 @@ class RedditFooter(CachedTemplate):
     def __init__(self):
         self.nav = [
             NavMenu([
-                    NamedButton("blog", False, nocname=True),
+                    NamedButton("blog", False, nocname=True, dest="/blog"),
                     NamedButton("about", False, nocname=True),
                     NamedButton("team", False, nocname=True, dest="/about/team"),
-                    NamedButton("code", False, nocname=True),
+                    NamedButton("source_code", False, nocname=True, dest="/code"),
                     NamedButton("advertising", False, nocname=True),
                     NamedButton("jobs", False, nocname=True),
                 ],
@@ -878,10 +891,11 @@ class RedditFooter(CachedTemplate):
                 separator = ""),
 
             NavMenu([
-                    NamedButton("wiki", False, nocname=True),
-                    OffsiteButton(_("FAQ"), dest = "/wiki/faq", nocname=True),
-                    OffsiteButton(_("reddiquette"), nocname=True, dest = "/wiki/reddiquette"),
                     NamedButton("rules", False, nocname=True),
+                    NamedButton("faq", False, nocname=True, dest="/wiki/faq"),
+                    NamedButton("wiki", False, nocname=True),
+                    NamedButton("reddiquette", False, nocname=True, dest="/wiki/reddiquette"),
+                    NamedButton("transparency", False, nocname=True, dest="/wiki/transparency"),
                     NamedButton("contact", False),
                 ],
                 title = _("help"),
@@ -889,23 +903,21 @@ class RedditFooter(CachedTemplate):
                 separator = ""),
 
             NavMenu([
-                    OffsiteButton("mobile", "http://i.reddit.com"),
-                    OffsiteButton(_("firefox extension"), "https://addons.mozilla.org/firefox/addon/socialite/"),
-                    OffsiteButton(_("chrome extension"), "https://chrome.google.com/webstore/detail/algjnflpgoopkdijmkalfcifomdhmcbe"),
+                    OffsiteButton(_("Alien Blue iOS app"), "//alienblue.org"),
+                    OffsiteButton(_("reddit AMA app"), "//redditama.reddit.com/"),
+                    OffsiteButton(_("mobile site"), "//i.reddit.com"),
                     NamedButton("buttons", True),
-                    NamedButton("widget", True),
                 ],
-                title = _("tools"),
+                title = _("apps & tools"),
                 type = "flat_vert",
                 separator = ""),
 
             NavMenu([
-                    NamedButton("gold", False, nocname=True, dest = "/gold/about", css_class = "buygold"),
-                    NamedButton("store", False, nocname=True),
-                    OffsiteButton(_("redditgifts"), "http://redditgifts.com"),
-                    OffsiteButton(_("reddit AMA app"), "https://redditama.reddit.com"),
-                    OffsiteButton(_("reddit.tv"), "http://reddit.tv"),
-                    OffsiteButton(_("radio reddit"), "http://radioreddit.com"),
+                    NamedButton("gold", False, nocname=True, dest="/gold/about", css_class="buygold"),
+                    OffsiteButton(_("reddit store"), "http://redditmarket.com"),
+                    OffsiteButton(_("redditgifts"), "//redditgifts.com"),
+                    OffsiteButton(_("reddit.tv"), "//reddit.tv"),
+                    OffsiteButton(_("radio reddit"), "//radioreddit.com"),
                 ],
                 title = _("<3"),
                 type = "flat_vert",
@@ -1375,10 +1387,7 @@ class CommentsPanel(Templated):
 
 class CommentVisitsBox(Templated):
     def __init__(self, visits, *a, **kw):
-        self.visits = []
-        for visit in reversed(visits):
-            pretty = timesince(visit, precision=60)
-            self.visits.append(pretty)
+        self.visits = list(reversed(visits))
         Templated.__init__(self, *a, **kw)
 
 class LinkInfoPage(Reddit):
@@ -1500,7 +1509,10 @@ class LinkInfoPage(Reddit):
             # thumbnails.
             return self.link.thumbnail
 
-        return static('icon.png')
+        # Default to the reddit icon if we've got nothing else.  Force it to be
+        # absolute because not all scrapers handle relative protocols or paths
+        # well.
+        return static('icon.png', absolute=True)
 
     def _build_og_description(self, meta_description):
         if self.link.selftext:
@@ -1957,7 +1969,7 @@ class ProfilePage(Reddit):
 
         rb.push(scb)
 
-        multis = LabeledMulti.by_owner(self.user)
+        multis = LabeledMulti.by_owner(self.user, load_subreddits=False)
 
         public_multis = [m for m in multis if m.is_public()]
         if public_multis:
@@ -1985,7 +1997,7 @@ class ProfilePage(Reddit):
 
         mod_sr_ids = Subreddit.reverse_moderator_ids(self.user)
         all_mod_srs = Subreddit._byID(mod_sr_ids, data=True,
-                                      return_dict=False)
+                                      return_dict=False, stale=True)
         mod_srs = [sr for sr in all_mod_srs if sr.can_view(c.user)]
         if mod_srs:
             rb.push(SideContentBox(title=_("moderator of"),
@@ -2244,9 +2256,7 @@ class SubredditTopBar(CachedTemplate):
     @property
     def my_reddits(self):
         if self._my_reddits is None:
-            self._my_reddits = Subreddit.user_subreddits(c.user,
-                                                         ids=False,
-                                                         stale=True)
+            self._my_reddits = Subreddit.user_subreddits(c.user, ids=False)
         return self._my_reddits
 
     @property
@@ -2426,7 +2436,8 @@ class AllInfoBar(Templated):
         else:
             self.description = strings.r_all_description
             sr_ids = Subreddit.user_subreddits(user)
-            srs = Subreddit._byID(sr_ids, data=True, return_dict=False)
+            srs = Subreddit._byID(
+                sr_ids, data=True, return_dict=False, stale=True)
             if srs:
                 self.allminus_url = '/r/all-' + '-'.join([sr.name for sr in srs])
 
@@ -2439,10 +2450,20 @@ class AllInfoBar(Templated):
 
 class CreateSubreddit(Templated):
     """reddit creation form."""
-    def __init__(self, site=None, name='', captcha=None):
-        Templated.__init__(self, site=site, name=name, captcha=captcha)
-
+    def __init__(self, site = None, name = '', captcha=None):
+        Templated.__init__(self,
+                           site=site,
+                           name=name,
+                           captcha=captcha,
+                           comment_sorts=CommentSortMenu.visible_options(),
+                           )
         self.color_options = Subreddit.KEY_COLORS
+        self.subreddit_selector = SubredditSelector(
+                placeholder=_("add subreddit"),
+                class_name="sr-name",
+                include_user_subscriptions=False,
+                show_add=True,
+            )
 
 
 class SubredditStylesheet(Templated):
@@ -2503,6 +2524,11 @@ class SubredditStylesheetSource(Templated):
     """A view of the unminified source of a subreddit's stylesheet."""
     def __init__(self, stylesheet_contents):
         Templated.__init__(self, stylesheet_contents=stylesheet_contents)
+
+class AutoModeratorConfig(Templated):
+    """A view of a subreddit's AutoModerator configuration."""
+    def __init__(self, automoderator_config):
+        Templated.__init__(self, automoderator_config=automoderator_config)
 
 class CssError(Templated):
     """Rendered error returned to the stylesheet editing page via ajax"""
@@ -2878,7 +2904,7 @@ class SearchBar(Templated):
                  subreddit_search=False, converted_data=None, facets={},
                  sort=None, recent=None, **kw):
         if header is None:
-            header = _("previous search")
+            header = _("search")
         self.header = header
 
         self.prev_search  = prev_search
@@ -3433,7 +3459,7 @@ class ModTableItem(InvitedModTableItem):
 class FlairPane(Templated):
     def __init__(self, num, after, reverse, name, user):
         # Make sure c.site isn't stale before rendering.
-        c.site = Subreddit._byID(c.site._id)
+        c.site = Subreddit._byID(c.site._id, data=True, stale=False)
 
         tabs = [
             ('grant', _('grant flair'), FlairList(num, after, reverse, name,
@@ -4691,11 +4717,8 @@ class Goldvertisement(Templated):
     def __init__(self):
         now = datetime.datetime.now(GOLD_TIMEZONE)
         today = now.date()
-        tomorrow = today + datetime.timedelta(days=1)
-        end_time = datetime.datetime(tomorrow.year,
-                                     tomorrow.month,
-                                     tomorrow.day,
-                                     tzinfo=GOLD_TIMEZONE)
+        tomorrow = now + datetime.timedelta(days=1)
+        end_time = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0)
         revenue_today = gold_revenue_volatile(today)
         yesterday = today - datetime.timedelta(days=1)
         revenue_yesterday = gold_revenue_steady(yesterday)
@@ -4724,17 +4747,19 @@ class Goldvertisement(Templated):
         Templated.__init__(self)
 
 class LinkCommentsSettings(Templated):
-    def __init__(self, link):
+    def __init__(self, link, sort, suggested_sort):
         Templated.__init__(self)
-        sr = link.subreddit_slow
+        self.sr = link.subreddit_slow
         self.link = link
         self.is_author = c.user_is_loggedin and c.user._id == link.author_id
         self.contest_mode = link.contest_mode
-        self.stickied = link._fullname == sr.sticky_fullname
+        self.stickied = link._fullname == self.sr.sticky_fullname
         self.sendreplies = link.sendreplies
         self.can_edit = (c.user_is_loggedin
                            and (c.user_is_admin or
-                                sr.is_moderator(c.user)))
+                                self.sr.is_moderator(c.user)))
+        self.sort = sort
+        self.suggested_sort = suggested_sort
 
 class ModeratorPermissions(Templated):
     def __init__(self, user, permissions_type, permissions,
@@ -4775,7 +4800,7 @@ class ListingChooser(Templated):
 
         self.show_samples = False
         if c.user_is_loggedin:
-            multis = LabeledMulti.by_owner(c.user)
+            multis = LabeledMulti.by_owner(c.user, load_subreddits=False)
             multis.sort(key=lambda multi: multi.name.lower())
             for multi in multis:
                 if not multi.is_hidden():
@@ -4783,8 +4808,8 @@ class ListingChooser(Templated):
 
             explore_sr = g.live_config["listing_chooser_explore_sr"]
             if explore_sr:
-                self.add_item("multi", name=_("explore multis"),
-                              site=Subreddit._by_name(explore_sr))
+                sr = Subreddit._by_name(explore_sr, stale=True)
+                self.add_item("multi", name=_("explore multis"), site=sr)
 
             self.show_samples = not multis
 
@@ -4911,7 +4936,10 @@ class ListingSuggestions(Templated):
                 self.suggestion_type = "explore"
                 return
 
-            multis = c.user_is_loggedin and LabeledMulti.by_owner(c.user)
+            if c.user_is_loggedin:
+                multis = LabeledMulti.by_owner(c.user, load_subreddits=False)
+            else:
+                multis = []
 
             if multis and c.site in multis:
                 multis.remove(c.site)

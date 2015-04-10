@@ -86,7 +86,14 @@ setup(
         "requests<1.0.0",
         "tinycss2",
         "unidecode",
+        "PyYAML",
     ],
+    # Extra dependencies that aren't needed for running the app.
+    # * https://pythonhosted.org/setuptools/setuptools.html#declaring-extras-optional-features-with-their-own-dependencies
+    # * https://github.com/pypa/sampleproject/blob/300f04dc44df51492deb859ac98ba521d2c7a17a/setup.py#L71-L77
+    extras_require = {
+        'test': ['mock'],
+    },
     dependency_links=[
         "https://github.com/reddit/snudown/archive/v1.1.3.tar.gz#egg=snudown-1.1.3",
         "https://s3.amazonaws.com/code.reddit.com/pycaptcha-0.4.tar.gz#egg=pycaptcha-0.4",
@@ -112,5 +119,11 @@ setup(
     [r2.provider.media]
     s3 = r2.lib.providers.media.s3:S3MediaProvider
     filesystem = r2.lib.providers.media.filesystem:FileSystemMediaProvider
+    [r2.provider.cdn]
+    cloudflare = r2.lib.providers.cdn.cloudflare:CloudFlareCdnProvider
+    null = r2.lib.providers.cdn.null:NullCdnProvider
+    [r2.provider.auth]
+    cookie = r2.lib.providers.auth.cookie:CookieAuthenticationProvider
+    http = r2.lib.providers.auth.http:HttpAuthenticationProvider
     """,
 )

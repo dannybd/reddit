@@ -75,6 +75,8 @@ class LinkVotesByAccount(VotesByAccount):
     _thing2_cls = Link
     _views = []
     _last_modified_name = "LinkVote"
+    # this is taken care of in r2.lib.db.queries:queue_vote
+    _write_last_modified = False
 
 
 class CommentVotesByAccount(VotesByAccount):
@@ -82,6 +84,8 @@ class CommentVotesByAccount(VotesByAccount):
     _thing2_cls = Comment
     _views = []
     _last_modified_name = "CommentVote"
+    # this is taken care of in r2.lib.db.queries:queue_vote
+    _write_last_modified = False
 
 
 class VoteDetailsByThing(tdb_cassandra.View):
@@ -230,7 +234,6 @@ class VoterIPByThing(tdb_cassandra.View):
 def cast_vote(sub, obj, dir, ip, vote_info, cheater, timer, date):
     from r2.models.admintools import valid_user, valid_thing, update_score
     from r2.lib.count import incr_sr_count
-    from r2.lib.db import queries
 
     names_by_dir = {True: "1", None: "0", False: "-1"}
 
@@ -313,9 +316,8 @@ def cast_vote(sub, obj, dir, ip, vote_info, cheater, timer, date):
     VotesByAccount.copy_from(vote, vote_info)
     timer.intermediate("cassavotes")
 
-    # update the search index
-    queries.changed(vote._thing2, boost_only=True)
-    timer.intermediate("changed")
+    vote._thing2.update_search_index(boost_only=True)
+    timer.intermediate("update_search_index")
 
     return vote
 

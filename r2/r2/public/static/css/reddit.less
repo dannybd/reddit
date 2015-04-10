@@ -2520,17 +2520,22 @@ textarea.gray { color: gray; }
 .footer {
     color: gray;
     padding: 5px;
-    margin: 15px;
+    margin: 15px auto;
     border:1px solid #F0F0F0;
-    display: inline-block;
+    display: flex;
+    display: -webkit-flex;
+    max-width: 600px;
 }
 
 .footer .col {
-    float: left;
+    display: inline-block;
+    vertical-align: top;
+    -webkit-flex: 0 0 25%;
+    flex: 0 0 25%;
     margin: 10px 0;
     padding: 0 15px;
     border-left: 1px solid #E0E0E0;
-    height: 9.5em;
+    box-sizing: border-box;
  }
 
 .footer .col:first-child {border: none;}
@@ -5069,6 +5074,13 @@ ul.colors {
 }
 .linefield .upload label {
     font-size: small;
+}
+.linefield .upload > li {
+    margin-top: 10px;
+
+    &:first-child {
+      margin-top: 0;
+    }
 }
 
 .linefield.usertext .infobar {
@@ -8721,11 +8733,17 @@ div.usertable .note {
 
 .api-help .parameters th {
     font-family: 'Courier New', monospace;
-    width: 50%;
+    line-height: 1.6;
+    width: 30%;
+    padding-right: 10px;
 }
 
 .api-help .parameters td pre {
     margin: .5em 0;
+}
+
+.api-help .parameters code {
+    white-space: pre-wrap;
 }
 
 #classy-error {
@@ -10580,7 +10598,7 @@ body.banned.deleted div#header {
     padding-bottom: 10px;
 
     .c-checkbox {
-      margin: 8px 0;
+      margin: 10px 0;
     }
   }
 
@@ -10598,6 +10616,29 @@ body.banned.deleted div#header {
 
   #embed-preview {
     overflow-y: hidden;
+  }
+}
+
+#related-srs {
+  margin: 3px;
+  font-size: smaller;
+}
+
+#add-related-sr {
+  margin-left: 3px;
+  font-size: smaller;
+
+  #sr-autocomplete-area,
+  div.error {
+    display: inline-block;
+  }
+
+  #sr-autocomplete {
+    width: 200px;
+  }
+
+  #sr-drop-down {
+    width: 206px;
   }
 }
 

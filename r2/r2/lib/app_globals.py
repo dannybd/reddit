@@ -43,8 +43,6 @@ import pytz
 from r2.config import queues
 from r2.lib.cache import (
     CacheChain,
-    CassandraCache,
-    CassandraCacheChain,
     CL_ONE,
     CL_QUORUM,
     CMemcache,
@@ -52,6 +50,7 @@ from r2.lib.cache import (
     HardcacheChain,
     LocalCache,
     MemcacheChain,
+    Permacache,
     SelfEmptyingCache,
     StaleCacheChain,
 )
@@ -170,6 +169,7 @@ class Globals(object):
             'num_comments',
             'max_comments',
             'max_comments_gold',
+            'max_comment_parent_walk',
             'max_sr_images',
             'num_serendipity',
             'sr_dropdown_threshold',
@@ -288,6 +288,7 @@ class Globals(object):
 
         ConfigValue.timeinterval: [
             'ARCHIVE_AGE',
+            "vote_queue_grace_period",
         ],
 
         config_gold_price: [
@@ -317,6 +318,7 @@ class Globals(object):
             'spotlight_interest_sub_p',
             'spotlight_interest_nosub_p',
             'gold_revenue_goal',
+            'invalid_key_sample_rate',
         ],
         ConfigValue.tuple: [
             'fastlane_links',
@@ -421,12 +423,33 @@ class Globals(object):
     def setup(self):
         self.queues = queues.declare_queues(self)
 
+        self.extension_subdomains = dict(
+            m="mobile",
+            i="compact",
+            api="api",
+            rss="rss",
+            xml="xml",
+            json="json",
+        )
+
         ################# PROVIDERS
+        self.auth_provider = select_provider(
+            self.config,
+            self.pkg_resources_working_set,
+            "r2.provider.auth",
+            self.authentication_provider,
+        )
         self.media_provider = select_provider(
             self.config,
             self.pkg_resources_working_set,
             "r2.provider.media",
             self.media_provider,
+        )
+        self.cdn_provider = select_provider(
+            self.config,
+            self.pkg_resources_working_set,
+            "r2.provider.cdn",
+            self.cdn_provider,
         )
         self.startup_timer.intermediate("providers")
 
@@ -618,12 +641,9 @@ class Globals(object):
         # memcaches used in front of the permacache CF in cassandra.
         # XXX: this is a legacy thing; permacache was made when C* didn't have
         # a row cache.
-        if self.permacache_memcaches:
-            permacache_memcaches = CMemcache(self.permacache_memcaches,
-                                             min_compress_len=50 * 1024,
-                                             num_clients=num_mc_clients)
-        else:
-            permacache_memcaches = None
+        permacache_memcaches = CMemcache(self.permacache_memcaches,
+                                         min_compress_len=1400,
+                                         num_clients=num_mc_clients)
 
         # the stalecache is a memcached local to the current app server used
         # for data that's frequently fetched but doesn't need to be fresh.
@@ -670,11 +690,9 @@ class Globals(object):
                 ),
         }
 
-        permacache_cf = CassandraCache(
+        permacache_cf = Permacache._setup_column_family(
             'permacache',
             self.cassandra_pools[self.cassandra_default_pool],
-            read_consistency_level=self.cassandra_rcl,
-            write_consistency_level=self.cassandra_wcl
         )
 
         self.startup_timer.intermediate("cassandra")
@@ -751,16 +769,28 @@ class Globals(object):
         cache_chains.update(pagecache=self.pagecache)
 
         # the thing_cache is used in tdb_cassandra.
-        self.thing_cache = CacheChain((localcache_cls(),))
+        self.thing_cache = CacheChain((localcache_cls(),), check_keys=False)
         cache_chains.update(thing_cache=self.thing_cache)
 
-        self.permacache = CassandraCacheChain(
-            localcache_cls(),
+        if stalecaches:
+            permacache_cache = StaleCacheChain(
+                localcache_cls(),
+                stalecaches,
+                permacache_memcaches,
+                check_keys=False,
+            )
+        else:
+            permacache_cache = CacheChain(
+                (localcache_cls(), permacache_memcaches),
+                check_keys=False,
+            )
+        cache_chains.update(permacache=permacache_cache)
+
+        self.permacache = Permacache(
+            permacache_cache,
             permacache_cf,
-            memcache=permacache_memcaches,
             lock_factory=self.make_lock,
         )
-        cache_chains.update(permacache=self.permacache)
 
         # hardcache is used for various things that tend to expire
         # TODO: replace hardcache w/ cassandra stuff

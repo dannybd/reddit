@@ -23,11 +23,12 @@
 from pylons import c, request
 from pylons.i18n import _, N_
 
+from r2.config import feature
 from r2.lib.db import operators
 from r2.lib.filters import _force_unicode
 from r2.lib.search import sorts as search_sorts
 from r2.lib.strings import StringHandler, plurals
-from r2.lib.utils import  query_string, timeago
+from r2.lib.utils import  class_property, query_string, timeago
 from r2.lib.wrapped import Styled
 
 
@@ -56,17 +57,18 @@ menu =   MenuHandler(hot          = _('hot'),
                      gilded       = _('gilded'),
                      confidence   = _('best'),
                      random       = _('random'),
+                     qa           = _('q&a'),
                      saved        = _('saved {toolbar}'),
                      recommended  = _('recommended'),
                      rising       = _('rising'), 
                      admin        = _('admin'), 
                                  
                      # time sort words
-                     hour         = _('this hour'),
-                     day          = _('today'),
-                     week         = _('this week'),
-                     month        = _('this month'),
-                     year         = _('this year'),
+                     hour         = _('past hour'),
+                     day          = _('past 24 hours'),
+                     week         = _('past week'),
+                     month        = _('past month'),
+                     year         = _('past year'),
                      all          = _('all time'),
                                   
                      # "kind" words
@@ -81,18 +83,20 @@ menu =   MenuHandler(hot          = _('hot'),
                      logout       = _("logout"),
                      
                      #reddit footer strings
+                     faq          = _("FAQ"),
+                     reddiquette  = _("reddiquette"),
                      contact      = _("contact us"),
                      buttons      = _("buttons"),
                      widget       = _("widget"), 
-                     code         = _("source code"),
                      mobile       = _("mobile"), 
-                     store        = _("store"),  
                      advertising  = _("advertise"),
                      gold         = _('reddit gold'),
                      reddits      = _('subreddits'),
                      team         = _('team'),
-                     rules        = _('rules'),
+                     rules        = _('site rules'),
                      jobs         = _('jobs'),
+                     transparency = _("transparency"),
+                     source_code  = _("source code"),
 
                      #preferences
                      options      = _('options'),
@@ -523,7 +527,8 @@ class SortMenu(NavMenu):
         options = self.make_buttons()
         default = default or self._default
         base_path = base_path or request.path
-        NavMenu.__init__(self, options, default=default, title=_(self._title),
+        title = title or _(self._title)
+        NavMenu.__init__(self, options, default=default, title=title,
                          type=self._type, base_path=base_path,
                          separator=separator, _id=_id, css_class=css_class)
 
@@ -547,6 +552,7 @@ class SortMenu(NavMenu):
         "controversial": operators.desc('_controversy'),
         "confidence": operators.desc('_confidence'),
         "random": operators.shuffled('_confidence'),
+        "qa": operators.desc('_qa'),
     }
     _reverse_mapping = {v: k for k, v in _mapping.iteritems()}
 
@@ -568,9 +574,36 @@ class CommentSortMenu(SortMenu):
     """Sort menu for comments pages"""
     _default = 'confidence'
     _options = ('confidence', 'top', 'new', 'hot', 'controversial', 'old',
-                 'random')
-    hidden_options = ('random',)
+                 'random', 'qa',)
     button_cls = PostButton
+
+    # Links may have a suggested sort of 'blank', which is an explicit None -
+    # that is, do not check the subreddit for a suggested sort, either.
+    suggested_sort_options = _options + ('blank',)
+
+    def __init__(self, *args, **kwargs):
+        self.suggested_sort = kwargs.pop('suggested_sort', None)
+        super(CommentSortMenu, self).__init__(*args, **kwargs)
+
+    @classmethod
+    def visible_options(cls):
+        return set(cls._options) - set(cls.hidden_options)
+
+    @class_property
+    def hidden_options(cls):
+        sorts = ['random']
+        if not feature.is_enabled('qa_sort'):
+            sorts.append('qa')
+        if feature.is_enabled('remove_hot_comments'):
+            sorts.append('hot')
+        return sorts
+
+    def make_title(self, attr):
+        title = super(CommentSortMenu, self).make_title(attr)
+        if attr == self.suggested_sort:
+            return title + ' ' + _('(suggested)')
+        else:
+            return title
 
 
 class SearchSortMenu(SortMenu):

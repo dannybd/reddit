@@ -81,10 +81,9 @@ from r2.models.last_modified import LastModified
 from r2.lib.menus import CommentSortMenu
 from r2.lib.captcha import get_iden
 from r2.lib.strings import strings
-from r2.lib.filters import _force_unicode, websafe_json, websafe, spaceCompress
+from r2.lib.filters import _force_unicode, _force_utf8, websafe_json, websafe, spaceCompress
 from r2.lib.template_helpers import format_html
 from r2.lib.db import queries
-from r2.lib.db.queries import changed
 from r2.lib import media
 from r2.lib.db import tdb_cassandra
 from r2.lib import promote
@@ -532,7 +531,7 @@ class ApiController(RedditController):
                                  prefix = "rate_submit_")
 
         queries.new_link(l)
-        changed(l)
+        l.update_search_index()
 
         if then == 'comments':
             path = add_sr(l.make_permalink_slow())
@@ -794,12 +793,18 @@ class ApiController(RedditController):
         """
         self.check_api_friend_oauth_scope(type)
 
+        victim = iuser or nuser
+        
         if type in self._sr_friend_types:
             if isinstance(c.site, FakeSubreddit):
                 abort(403, 'forbidden')
             container = c.site
             if c.user._spam:
-                return
+                # The requesting user is marked as spam, and is trying to
+                # do a mod action. The only action they should be allowed to do
+                # and have it stick is demodding themself
+                if not (c.user == victim and type == 'moderator'):
+                    return
         else:
             container = VByName('container').run(container)
             if not container:
@@ -808,7 +813,6 @@ class ApiController(RedditController):
         # The user who made the request must be an admin or a moderator
         # for the privilege change to succeed.
         # (Exception: a user can remove privilege from oneself)
-        victim = iuser or nuser
         required_perms = []
         if c.user != victim:
             if type.startswith('wiki'):
@@ -1140,13 +1144,19 @@ class ApiController(RedditController):
         notify_user_added("accept_moderator_invite", c.user, c.user, c.site)
         jquery.refresh()
 
-    @validatedForm(VUser('curpass', default=''),
-                   VModhash(),
-                   password=VPasswordChange(
-                        ['curpass', 'curpass'],
-                        docs=dict(curpass="the user's current password")
-                   ),
-                   dest = VDestination())
+    @validatedForm(
+        VUser(),
+        VModhash(),
+        VVerifyPassword("curpass", fatal=False),
+        # XXX: Is this necessary? Seems like it won't let people with
+        # passwords that would be invalid by current password rules clear
+        # their sessions.
+        password=VPasswordChange(
+            ['curpass', 'curpass'],
+            docs=dict(curpass="the user's current password")
+        ),
+        dest=VDestination(),
+    )
     def POST_clear_sessions(self, form, jquery, password, dest):
         """Clear all session cookies and replace the current one.
 
@@ -1171,13 +1181,16 @@ class ApiController(RedditController):
         # invalidated.  drop a new cookie.
         self.login(c.user)
 
-    @validatedForm(VUser("curpass", default=""),
-                   VModhash(),
-                   force_https=VBoolean("force_https"),
-                   password=VPasswordChange(
-                       ["curpass", "curpass"],
-                       docs=dict(curpass="the user's current password"),
-                   ))
+    @validatedForm(
+        VUser(),
+        VModhash(),
+        VVerifyPassword("curpass", fatal=False),
+        force_https=VBoolean("force_https"),
+        password=VPasswordChange(
+            ["curpass", "curpass"],
+            docs=dict(curpass="the user's current password"),
+        ),
+    )
     def POST_set_force_https(self, form, jquery, password, force_https):
         """Toggle HTTPS-only sessions, invalidating other sessions.
 
@@ -1211,8 +1224,9 @@ class ApiController(RedditController):
         form.redirect(hsts_modify_redirect("/prefs/security"))
 
     @validatedForm(
-        VUser('curpass', default=''),
+        VUser(),
         VModhash(),
+        VVerifyPassword("curpass", fatal=False),
         email=ValidEmails("email", num=1),
         verify=VBoolean("verify"),
         dest=VDestination(),
@@ -1261,8 +1275,9 @@ class ApiController(RedditController):
             form.set_text('.status', _('your email has been updated'))
 
     @validatedForm(
-        VUser('curpass', default=''),
+        VUser(),
         VModhash(),
+        VVerifyPassword("curpass", fatal=False),
         password=VPasswordChange(['newpass', 'verpass']),
     )
     def POST_update_password(self, form, jquery, password):
@@ -1340,8 +1355,7 @@ class ApiController(RedditController):
             promote.reject_promotion(thing)
         thing._commit()
 
-        # flag search indexer that something has changed
-        changed(thing)
+        thing.update_search_index()
 
         #expire the item from the sr cache
         if isinstance(thing, Link):
@@ -1376,8 +1390,7 @@ class ApiController(RedditController):
             ModAction.create(thing.subreddit_slow, c.user, target=thing,
                              action='marknsfw')
 
-        # flag search indexer that something has changed
-        changed(thing)
+        thing.update_search_index()
 
     @require_oauth2_scope("modposts")
     @noresponse(VUser(),
@@ -1407,8 +1420,7 @@ class ApiController(RedditController):
             ModAction.create(thing.subreddit_slow, c.user, target=thing,
                              action='marknsfw', details='remove')
 
-        # flag search indexer that something has changed
-        changed(thing)
+        thing.update_search_index()
 
     @require_oauth2_scope("edit")
     @noresponse(VUser(),
@@ -1444,6 +1456,31 @@ class ApiController(RedditController):
         media_cache.MediaByURL.add_placeholder(thing.url, autoplay=False)
 
         amqp.add_item("scraper_q", thing._fullname)
+
+    @require_oauth2_scope("modposts")
+    @validatedForm(VUser(),
+                   VModhash(),
+                   VSrCanBan('id'),
+                   thing=VByName('id', thing_cls=Link),
+                   sort=VOneOf('sort', CommentSortMenu.suggested_sort_options))
+    def POST_set_suggested_sort(self, form, jquery, thing, sort):
+        """Set a default sort for a link.
+
+        Default sorts are useful to display comments in a certain preferred way
+        for posts. For example, casual conversation may be better sorted by new
+        by default, or threads where voting is less important may be sorted by
+        random. A sort of an empty string clears the default sort.
+        """
+        if not feature.is_enabled('default_sort'):
+            return abort(403, "This feature is not yet enabled")
+
+        if c.user._id != thing.author_id:
+            ModAction.create(thing.subreddit_slow, c.user, target=thing,
+                             action='setsuggestedsort')
+
+        thing.suggested_sort = sort
+        thing._commit()
+        jquery.refresh()
 
     @require_oauth2_scope("modposts")
     @validatedForm(VUser(),
@@ -1603,7 +1640,8 @@ class ApiController(RedditController):
                 return
 
         block_acct = Account._byID(thing.author_id)
-        if block_acct.name in g.admins or thing.display_author:
+        display_author = getattr(thing, "display_author", None)
+        if block_acct.name in g.admins or display_author:
             return
         c.user.add_enemy(block_acct)
 
@@ -1688,7 +1726,7 @@ class ApiController(RedditController):
         if hasattr(item, "editted"):
             queries.edit(item)
 
-        changed(item)
+        item.update_search_index()
 
         amqp.add_item('usertext_edited', item._fullname)
 
@@ -1922,14 +1960,13 @@ class ApiController(RedditController):
                 VRatelimit.ratelimit(rate_user=True, rate_ip = True,
                                      prefix = "rate_share_")
 
-
     @require_oauth2_scope("vote")
     @noresponse(VUser(),
                 VModhash(),
                 vote_info=VVotehash('vh'),
                 dir=VInt('dir', min=-1, max=1, docs={"dir":
-                    "vote direction. one of (1, 0, -1)"}),
-                thing = VByName('id'))
+                         "vote direction. one of (1, 0, -1)"}),
+                thing=VByName('id'))
     @api_doc(api_section.links_and_comments)
     def POST_vote(self, dir, thing, vote_info):
         """Cast a vote on a thing.
@@ -1951,16 +1988,16 @@ class ApiController(RedditController):
         store = True
 
         if not thing or thing._deleted:
-            return
+            return self.abort404()
 
         hooks.get_hook("vote.validate").call(thing=thing)
 
         if not isinstance(thing, (Link, Comment)):
-            return
+            return self.abort404()
 
         if isinstance(thing, Link) and promote.is_promo(thing):
             if not promote.is_promoted(thing):
-                return      
+                return abort(400, "Bad Request")
 
         if vote_info == 'rejected':
             reject_vote(thing)
@@ -1978,7 +2015,7 @@ class ApiController(RedditController):
                            cheater=c.cheater)
 
     @require_oauth2_scope("modconfig")
-    @validatedForm(VUser(),
+    @validatedForm(VSrModerator(perms='config'),
                    VModhash(),
                    # nop is safe: handled after auth checks below
                    stylesheet_contents=nop('stylesheet_contents',
@@ -2387,22 +2424,56 @@ class ApiController(RedditController):
                 value = request.params.get(key)
                 kw[key] = validator.run(value)
 
+        if feature.is_enabled('default_sort'):
+            vsort = VOneOf('suggested_comment_sort',
+                           CommentSortMenu._options,
+                           default=None,
+                           )
+            sort_param = request.params.get('suggested_comment_sort')
+            kw['suggested_comment_sort'] = vsort.run(sort_param)
+
         # the status button is outside the form -- have to reset by hand
         form.parent().set_html('.status', "")
 
         redir = False
-        kw = dict((k, v) for k, v in kw.iteritems()
-                  if k in ('name', 'title', 'domain', 'description',
-                           'show_media', 'exclude_banned_modqueue',
-                           'show_cname_sidebar', 'type', 'public_traffic',
-                           'collapse_deleted_comments', 'link_type',
-                           'submit_link_label', 'comment_score_hide_mins',
-                           'submit_text_label', 'lang', 'css_on_cname',
-                           'header_title', 'over_18', 'wikimode', 'wiki_edit_karma',
-                           'wiki_edit_age', 'allow_top', 'public_description',
-                           'spam_links', 'spam_selfposts', 'spam_comments',
-                           'submit_text', 'community_rules', 'related_subreddits',
-                           'key_color', 'hide_ads'))
+        keyword_fields = [
+            'allow_top',
+            'collapse_deleted_comments',
+            'comment_score_hide_mins',
+            'community_rules',
+            'css_on_cname',
+            'description',
+            'domain',
+            'exclude_banned_modqueue',
+            'header_title',
+            'hide_ads',
+            'key_color',
+            'lang',
+            'link_type',
+            'name',
+            'over_18',
+            'public_description',
+            'public_traffic',
+            'related_subreddits',
+            'show_cname_sidebar',
+            'show_media',
+            'spam_comments',
+            'spam_links',
+            'spam_selfposts',
+            'submit_link_label',
+            'submit_text',
+            'submit_text_label',
+            'title',
+            'type',
+            'wiki_edit_age',
+            'wiki_edit_karma',
+            'wikimode',
+        ]
+
+        if feature.is_enabled('default_sort'):
+            keyword_fields.append('suggested_comment_sort')
+
+        kw = {k: v for k, v in kw.iteritems() if k in keyword_fields}
 
         public_description = kw.pop('public_description')
         description = kw.pop('description')
@@ -2505,7 +2576,7 @@ class ApiController(RedditController):
             pass
         elif form.has_errors('comment_score_hide_mins', errors.BAD_NUMBER):
             pass
-        elif form.has_errors('related_subreddits',
+        elif form.has_errors('related_subreddits', errors.SUBREDDIT_NOEXIST,
                              errors.BAD_SR_NAME, errors.TOO_MANY_SUBREDDITS):
             pass
         elif form.has_errors('hide_ads', errors.GOLD_ONLY_SR_REQUIRED):
@@ -2533,7 +2604,7 @@ class ApiController(RedditController):
                                      prefix = "create_reddit_")
 
             queries.new_subreddit(sr)
-            changed(sr)
+            sr.update_search_index()
 
         #editting an existing reddit
         elif sr.is_moderator_with_perms(c.user, 'config') or c.user_is_admin:
@@ -2544,6 +2615,19 @@ class ApiController(RedditController):
 
             if not sr.domain:
                 del kw['css_on_cname']
+
+            #notify ads if sr in a collection changes over_18 to true
+            if kw.get('over_18', False) and not sr.over_18:
+                collections = []
+                for collection in Collection.get_all():
+                    if (sr.name in collection.sr_names
+                            and not collection.over_18):
+                        collections.append(collection.name)
+
+                if collections:
+                    msg = "%s now NSFW, in collection(s) %s"
+                    msg %= (sr.name, ', '.join(collections))
+                    emailer.sales_email(msg)
 
             # do not clobber these fields if absent in request
             no_clobber = ('community_rules', 'key_color', 'related_subreddits')
@@ -2564,8 +2648,7 @@ class ApiController(RedditController):
                 Subreddit._by_domain(old_domain, _update = True)
                 Subreddit._by_domain(sr.domain, _update = True)
 
-            # flag search indexer that something has changed
-            changed(sr)
+            sr.update_search_index()
             form.parent().set_text('.status', _("saved"))
 
         if form.has_error():
@@ -2822,10 +2905,12 @@ class ApiController(RedditController):
         return {'categories': categories}
 
     @require_oauth2_scope("save")
-    @noresponse(VUser(),
-                VModhash(),
-                category = VSavedCategory('category'),
-                thing = VByName('id'))
+    @noresponse(
+        VUser(),
+        VModhash(),
+        category=VSavedCategory('category'),
+        thing=VByName('id'),
+    )
     @api_doc(api_section.links_and_comments)
     def POST_save(self, thing, category):
         """Save a link or comment.
@@ -2835,17 +2920,23 @@ class ApiController(RedditController):
         See also: [/api/unsave](#POST_api_unsave).
 
         """
-        if not thing: return
+        if not thing or not isinstance(thing, (Link, Comment)):
+            abort(400)
+
         if category and not c.user.gold:
             category = None
+
         if ('BAD_SAVE_CATEGORY', 'category') in c.errors:
             abort(403)
+
         thing._save(c.user, category=category)
 
     @require_oauth2_scope("save")
-    @noresponse(VUser(),
-                VModhash(),
-                thing = VByName('id'))
+    @noresponse(
+        VUser(),
+        VModhash(),
+        thing=VByName('id'),
+    )
     @api_doc(api_section.links_and_comments)
     def POST_unsave(self, thing):
         """Unsave a link or comment.
@@ -2855,7 +2946,9 @@ class ApiController(RedditController):
         See also: [/api/save](#POST_api_save).
 
         """
-        if not thing: return
+        if not thing or not isinstance(thing, (Link, Comment)):
+            abort(400)
+
         thing._unsave(c.user)
 
     def collapse_handler(self, things, collapse):
@@ -2987,16 +3080,12 @@ class ApiController(RedditController):
         link=VByName('link_id'),
         sort=VMenu('morechildren', CommentSortMenu, remember=False),
         children=VCommentIDs('children'),
-        pv_hex=VPrintable(
-            "pv_hex", 40,
-            docs={"pv_hex": "(optional) a previous-visits token"}),
         mc_id=nop(
             "id",
             docs={"id": "(optional) id of the associated MoreChildren object"}),
     )
     @api_doc(api_section.links_and_comments)
-    def GET_morechildren(self, form, jquery, link, sort, children,
-                          pv_hex, mc_id):
+    def GET_morechildren(self, form, jquery, link, sort, children, mc_id):
         """Retrieve additional comments omitted from a base comment tree.
 
         When a comment tree is rendered, the most relevant comments are
@@ -3011,9 +3100,6 @@ class ApiController(RedditController):
         If `id` is passed, it should be the ID of the MoreComments object this
         call is replacing. This is needed only for the HTML UI's purposes and
         is optional otherwise.
-
-        `pv_hex` is part of the reddit gold "previous visits" feature. It is
-        optional and deprecated.
 
         **NOTE:** you may only make one request at a time to this API endpoint.
         Higher concurrency will result in an error being returned.
@@ -3034,9 +3120,6 @@ class ApiController(RedditController):
         try:
             if not link or not link.subreddit_slow.can_view(c.user):
                 return abort(403,'forbidden')
-
-            if pv_hex:
-                c.previous_visits = g.cache.get(pv_hex)
 
             if children:
                 builder = CommentBuilder(link, CommentSortMenu.operator(sort),
@@ -3069,9 +3152,6 @@ class ApiController(RedditController):
                 # morechildren link
                 jquery.things(str(mc_id)).remove()
                 jquery.insert_things(a, append = True)
-
-                if pv_hex:
-                    jquery.rehighlight_new_comments()
         finally:
             if lock:
                 lock.release()
@@ -3255,7 +3335,7 @@ class ApiController(RedditController):
                 else:
                     # tried to unsubscribe but user was not subscribed
                     return abort(404, 'not found')
-            changed(sr, True)
+            sr.update_search_index(boost_only=True)
         except CreationError:
             # This only seems to happen when someone is pounding on the
             # subscribe button or the DBs are really lagged; either way,
@@ -3349,22 +3429,6 @@ class ApiController(RedditController):
                    css_class = VFlairCss("css_class"))
     @api_doc(api_section.flair, uses_site=True)
     def POST_flair(self, form, jquery, user, link, text, css_class):
-        if link:
-            flair_type = LINK_FLAIR
-            if hasattr(c.site, '_id') and c.site._id == link.sr_id:
-                site = c.site
-            else:
-                site = Subreddit._byID(link.sr_id, data=True)
-                # make sure c.user has permission to set flair on this link
-                if not (c.user_is_admin 
-                        or site.is_moderator_with_perms(c.user, 'flair')):
-                    abort(403, 'forbidden')
-        else:
-            flair_type = USER_FLAIR
-            site = c.site
-            if form.has_errors('name', errors.BAD_FLAIR_TARGET):
-                return
-
         if form.has_errors('css_class', errors.BAD_CSS_NAME):
             form.set_text(".status:first", _('invalid css class'))
             return
@@ -3372,48 +3436,32 @@ class ApiController(RedditController):
             form.set_text(".status:first", _('too many css classes'))
             return
 
-        if flair_type == LINK_FLAIR:
+        if link:
+            if form.has_errors("link", errors.BAD_FLAIR_TARGET):
+                return
+
+            link.set_flair(text, css_class, set_by=c.user)
+        else:
+            if form.has_errors("name", errors.BAD_FLAIR_TARGET):
+                return
+
+            user.set_flair(c.site, text, css_class, set_by=c.user)
+
+            # XXX: this is still gross with all the UI code in here
             if not text and not css_class:
-                text = css_class = None
-            link.flair_text = text
-            link.flair_css_class = css_class
-            link._commit()
-            changed(link)
-            ModAction.create(site, c.user, action='editflair', target=link,
-                             details='flair_edit')
-        elif flair_type == USER_FLAIR:
-            if not text and not css_class:
-                # empty text and css is equivalent to unflairing
-                text = css_class = None
-                c.site.remove_flair(user)
                 jquery('#flairrow_%s' % user._id36).hide()
-                new = False
             elif not c.site.is_flair(user):
-                c.site.add_flair(user)
-                new = True
-            else:
-                new = False
-
-            # Save the flair details in the account data.
-            setattr(user, 'flair_%s_text' % c.site._id, text)
-            setattr(user, 'flair_%s_css_class' % c.site._id, css_class)
-            user._commit()
-
-            if c.user != user:
-                ModAction.create(site, c.user, action='editflair',
-                                 target=user, details='flair_edit')
-
-            if new:
                 jquery.redirect('?name=%s' % user.name)
-            else:
-                flair = WrappedUser(
-                    user, force_show_flair=True,
-                    include_flair_selector=True).render(style='html')
-                jquery('.tagline .flairselectable.id-%s'
-                    % user._fullname).parent().html(flair)
-                jquery('input[name="text"]').data('saved', text)
-                jquery('input[name="css_class"]').data('saved', css_class)
-                form.set_text('.status', _('saved'))
+                return
+
+            wrapped_user = WrappedUser(
+                user, force_show_flair=True, include_flair_selector=True)
+            rendered = wrapped_user.render(style='html')
+            jquery('.tagline .flairselectable.id-%s'
+                % user._fullname).parent().html(rendered)
+            jquery('input[name="text"]').data('saved', text)
+            jquery('input[name="css_class"]').data('saved', css_class)
+            form.set_text('.status', _('saved'))
 
     @require_oauth2_scope("modflair")
     @validatedForm(VSrModerator(perms='flair'),
@@ -3421,16 +3469,10 @@ class ApiController(RedditController):
                    user = VFlairAccount("name"))
     @api_doc(api_section.flair, uses_site=True)
     def POST_deleteflair(self, form, jquery, user):
-        # Check validation.
         if form.has_errors('name', errors.USER_DOESNT_EXIST, errors.NO_USER):
             return
-        c.site.remove_flair(user)
-        setattr(user, 'flair_%s_text' % c.site._id, None)
-        setattr(user, 'flair_%s_css_class' % c.site._id, None)
-        user._commit()
 
-        ModAction.create(c.site, c.user, action='editflair', target=user,
-                         details='flair_delete')
+        user.set_flair(c.site, None, None, set_by=c.user)
 
         jquery('#flairrow_%s' % user._id36).remove()
         unflair = WrappedUser(
@@ -3468,11 +3510,6 @@ class ApiController(RedditController):
                                   % name)
                 continue
 
-            if not text and not css_class:
-                # this is equivalent to unflairing
-                text = None
-                css_class = None
-
             orig_text = text
             text = VFlairText('text').run(orig_text)
             if text and orig_text and len(text) < len(orig_text):
@@ -3487,21 +3524,15 @@ class ApiController(RedditController):
                 continue
 
             # all validation passed, enflair the user
+            user.set_flair(
+                c.site, text, css_class, set_by=c.user, log_details="csv")
+
             if text or css_class:
                 mode = 'added'
-                c.site.add_flair(user)
             else:
                 mode = 'removed'
-                c.site.remove_flair(user)
-            setattr(user, 'flair_%s_text' % c.site._id, text)
-            setattr(user, 'flair_%s_css_class' % c.site._id, css_class)
-            user._commit()
-
             line_result.status = '%s flair for user %s' % (mode, user.name)
             line_result.ok = True
-
-        ModAction.create(c.site, c.user, action='editflair',
-                         details='flair_csv')
 
         return BoringPage(_("API"), content = results).render()
 
@@ -3706,61 +3737,67 @@ class ApiController(RedditController):
                          text):
         if link:
             flair_type = LINK_FLAIR
-            if hasattr(c.site, '_id') and c.site._id == link.sr_id:
-                site = c.site
-            else:
-                site = Subreddit._byID(link.sr_id, data=True)
-            self_assign_enabled = site.link_flair_self_assign_enabled
+            subreddit = link.subreddit_slow
+            if not (c.user_is_admin or link.can_flair_slow(c.user)):
+                abort(403)
         else:
             flair_type = USER_FLAIR
-            site = c.site
-            self_assign_enabled = site.flair_self_assign_enabled
+            subreddit = c.site
+            if not (c.user_is_admin or user.can_flair_in_sr(c.user, subreddit)):
+                abort(403)
 
         if flair_template_id:
             try:
                 flair_template = FlairTemplateBySubredditIndex.get_template(
-                    site._id, flair_template_id, flair_type=flair_type)
+                    subreddit._id, flair_template_id, flair_type=flair_type)
             except NotFound:
                 # TODO: serve error to client
-                g.log.debug('invalid flair template for subreddit %s', site._id)
-                return
-        else:
-            flair_template = None
-            text = None
-
-        if not (c.user_is_admin
-                or site.is_moderator_with_perms(c.user, 'flair')):
-            if not self_assign_enabled:
-                # TODO: serve error to client
-                g.log.debug('flair self-assignment not permitted')
+                g.log.debug('invalid flair template for subreddit %s', subreddit._id)
                 return
 
-            # Ignore user choice if not an admin or mod.
-            user = c.user
+            text_editable = flair_template.text_editable
 
             # Ignore given text if user doesn't have permission to customize it.
-            if not (flair_template and flair_template.text_editable):
+            if not (text_editable or
+                        c.user_is_admin or
+                        subreddit.is_moderator_with_perms(c.user, "flair")):
                 text = None
 
-        if not text:
-            text = flair_template.text if flair_template else None
+            if not text:
+                text = flair_template.text
 
-        css_class = flair_template.css_class if flair_template else None
-        text_editable = (
-            flair_template.text_editable if flair_template else False)
+            css_class = flair_template.css_class
+        else:
+            flair_template = None
+            text_editable = False
+            text = None
+            css_class = None
 
-        if flair_type == USER_FLAIR:
-            site.add_flair(user)
-            setattr(user, 'flair_%s_text' % site._id, text)
-            setattr(user, 'flair_%s_css_class' % site._id, css_class)
-            user._commit()
+        if flair_type == LINK_FLAIR:
+            link.set_flair(text, css_class, set_by=c.user)
 
-            if ((c.user_is_admin
-                 or site.is_moderator_with_perms(c.user, 'flair'))
-                and c.user != user):
-                ModAction.create(site, c.user, action='editflair',
-                                 target=user, details='flair_edit')
+            # XXX: gross UI code
+            # Push some client-side updates back to the browser.
+            jquery('.id-%s .entry .linkflairlabel' % link._fullname).remove()
+            title_path = '.id-%s .entry > .title > .title' % link._fullname
 
+            # TODO: move this to a template
+            if flair_template:
+                classes = ' '.join('linkflair-' + c for c in css_class.split())
+                flair = format_html('<span class="linkflairlabel %s">%s</span>',
+                                    classes, text)
+
+                if subreddit.link_flair_position == 'left':
+                    jquery(title_path).before(flair)
+                elif subreddit.link_flair_position == 'right':
+                    jquery(title_path).after(flair)
+
+            # TODO: close the selector popup more gracefully
+            jquery('body').click()
+        else:
+            user.set_flair(subreddit, text, css_class, set_by=c.user)
+
+            # XXX: gross UI code
             # Push some client-side updates back to the browser.
             u = WrappedUser(user, force_show_flair=True,
                             flair_text_editable=text_editable,
@@ -3772,34 +3809,6 @@ class ApiController(RedditController):
                 'saved', text).val(text)
             jquery('#flairrow_%s input[name="css_class"]' % user._id36).data(
                 'saved', css_class).val(css_class)
-        elif flair_type == LINK_FLAIR:
-            link.flair_text = text
-            link.flair_css_class = css_class
-            link._commit()
-            changed(link)
-
-            if c.user_is_admin or site.is_moderator_with_perms(c.user, 'flair'):
-                ModAction.create(site, c.user, action='editflair',
-                                 target=link, details='flair_edit')
-
-            # Push some client-side updates back to the browser.
-
-            jquery('.id-%s .entry .linkflairlabel' % link._fullname).remove()
-            title_path = '.id-%s .entry > .title > .title' % link._fullname
-
-            # TODO: move this to a template
-            if flair_template:
-                classes = ' '.join('linkflair-' + c for c in css_class.split())
-                flair = format_html('<span class="linkflairlabel %s">%s</span>',
-                                    classes, text)
-
-                if site.link_flair_position == 'left':
-                    jquery(title_path).before(flair)
-                elif site.link_flair_position == 'right':
-                    jquery(title_path).after(flair)
-
-            # TODO: close the selector popup more gracefully
-            jquery('body').click()
 
     @validatedForm(secret_used=VAdminOrAdminSecret("secret"),
                    award=VByName("fullname"),
@@ -3924,18 +3933,28 @@ class ApiController(RedditController):
     @csrf_exempt
     @require_oauth2_scope("read")
     @json_validate(query=VPrintable('query', max_length=50),
-                   include_over_18=VBoolean('include_over_18', default=True))
+                   include_over_18=VBoolean('include_over_18', default=True),
+                   exact=VBoolean('exact', default=False))
     @api_doc(api_section.subreddits)
-    def POST_search_reddit_names(self, responder, query, include_over_18):
+    def POST_search_reddit_names(self, responder, query, include_over_18, exact):
         """List subreddit names that begin with a query string.
 
         Subreddits whose names begin with `query` will be returned. If
         `include_over_18` is false, subreddits with over-18 content
         restrictions will be filtered from the results.
 
+        If `exact` is true, only an exact match will be returned.
         """
         names = []
-        if query:
+        if query and exact:
+            try:
+                sr = Subreddit._by_name(query.strip())
+            except NotFound:
+                self.abort404()
+            else:
+                # not respecting include_over_18 for exact match
+                names = [sr.name]
+        elif query:
             names = search_reddits(query, include_over_18)
 
         return {'names': names}
@@ -3962,12 +3981,15 @@ class ApiController(RedditController):
     def POST_expando(self):
         return self.GET_expando()
 
-    @validatedForm(VUser('password', default=''),
-                   VModhash(),
-                   VOneTimePassword("otp",
-                                    required=not g.disable_require_admin_otp),
-                   remember=VBoolean("remember"),
-                   dest=VDestination())
+    @validatedForm(
+        VUser(),
+        VModhash(),
+        VVerifyPassword("password", fatal=False),
+        VOneTimePassword("otp",
+                         required=not g.disable_require_admin_otp),
+        remember=VBoolean("remember"),
+        dest=VDestination(),
+    )
     def POST_adminon(self, form, jquery, remember, dest):
         if c.user.name not in g.admins:
             self.abort403()
@@ -3986,8 +4008,11 @@ class ApiController(RedditController):
         self.enable_admin_mode(c.user)
         form.redirect(dest)
 
-    @validatedForm(VUser("password", default=""),
-                   VModhash())
+    @validatedForm(
+        VUser(),
+        VModhash(),
+        VVerifyPassword("password", fatal=False),
+    )
     def POST_generate_otp_secret(self, form, jquery):
         if form.has_errors("password", errors.WRONG_PASSWORD):
             return
@@ -4029,9 +4054,12 @@ class ApiController(RedditController):
 
         form.redirect("/prefs/security")
 
-    @validatedForm(VUser("password", default=""),
-                   VOneTimePassword("otp", required=True),
-                   VModhash())
+    @validatedForm(
+        VUser(),
+        VModhash(),
+        VVerifyPassword("password", fatal=False),
+        VOneTimePassword("otp", required=True),
+    )
     def POST_disable_otp(self, form, jquery):
         if form.has_errors("password", errors.WRONG_PASSWORD):
             return
@@ -4294,7 +4322,7 @@ class ApiController(RedditController):
         updates = {}
         updates["signed"] = signed
         if message and message.strip() != "":
-            updates["giftmessage"] = message
+            updates["giftmessage"] = _force_utf8(message)
 
         update_blob(str(code), updates)
 

@@ -42,7 +42,7 @@ from r2.lib import hooks, utils
 from r2.lib.log import log_text
 from mako.filters import url_escape
 from r2.lib.strings import strings, Score
-from r2.lib.db import tdb_cassandra
+from r2.lib.db import tdb_cassandra, sorts
 from r2.lib.db.tdb_cassandra import view_of
 from r2.lib.utils import sanitize_url
 from r2.models.gold import (
@@ -50,6 +50,7 @@ from r2.models.gold import (
     GildedLinksByAccount,
     make_gold_message,
 )
+from r2.models.modaction import ModAction
 from r2.models.subreddit import MultiReddit
 from r2.models.trylater import TryLater
 from r2.models.query_cache import CachedQueryMutator
@@ -64,6 +65,10 @@ import simplejson as json
 import random, re
 from collections import defaultdict
 from pycassa.cassandra.ttypes import NotFoundException
+from pycassa.system_manager import (
+    ASCII_TYPE,
+    DOUBLE_TYPE,
+)
 import pytz
 
 NOTIFICATION_EMAIL_DELAY = timedelta(hours=1)
@@ -75,6 +80,7 @@ class Link(Thing, Printable):
     _data_int_props = Thing._data_int_props + (
         'num_comments', 'reported', 'comment_tree_id', 'gildings')
     _defaults = dict(is_self=False,
+                     suggested_sort=None,
                      over_18=False,
                      over_18_override=False,
                      nsfw_str=False,
@@ -87,6 +93,7 @@ class Link(Thing, Printable):
                      gifts_embed_url=None,
                      media_autoplay=False,
                      domain_override=None,
+                     third_party_tracking=None,
                      promoted=None,
                      payment_flagged_reason="",
                      fraud=None,
@@ -538,7 +545,8 @@ class Link(Thing, Printable):
             item.domain_str = None
             if c.user.pref_domain_details:
                 urlparser = UrlParser(item.url)
-                if not item.is_self and urlparser.is_reddit_url():
+                if (not item.is_self and urlparser.is_reddit_url() and
+                        urlparser.is_web_safe_url()):
                     url_subreddit = urlparser.get_subreddit()
                     if (url_subreddit and
                             not isinstance(url_subreddit, DefaultSR)):
@@ -731,6 +739,30 @@ class Link(Thing, Printable):
         # If available, that should be used instead of calling this
         return Account._byID(self.author_id, data=True, return_dict=False)
 
+    @property
+    def responder_ids(self):
+        """Returns an iterable of the OP and other official responders in a
+        thread.
+
+        Designed for Q&A-type threads (eg /r/iama).
+        """
+        return (self.author_id,)
+
+    def sort_if_suggested(self):
+        """Returns a sort, if the link or its subreddit has suggested one."""
+        if self.suggested_sort:
+            # A suggested sort of "blank" means explicitly empty: Do not obey
+            # the subreddit's suggested sort, either.
+            if self.suggested_sort == 'blank':
+                return None
+            return self.suggested_sort
+
+        sr = self.subreddit_slow
+        if sr.suggested_comment_sort:
+            return sr.suggested_comment_sort
+
+        return None
+
     def can_flair_slow(self, user):
         """Returns whether the specified user can flair this link"""
         site = self.subreddit_slow
@@ -738,6 +770,16 @@ class Link(Thing, Printable):
                           site.link_flair_self_assign_enabled)
 
         return site.is_moderator_with_perms(user, 'flair') or can_assign_own
+
+    def set_flair(self, text=None, css_class=None, set_by=None):
+        self.flair_text = text
+        self.flair_css_class = css_class
+        self._commit()
+        self.update_search_index()
+
+        if set_by and set_by._id != self.author_id:
+            ModAction.create(self.subreddit_slow, set_by, action='editflair',
+                target=self, details='flair_edit')
 
     @classmethod
     def _utf8_encode(cls, value):
@@ -832,7 +874,6 @@ class Comment(Thing, Printable):
 
     @classmethod
     def _new(cls, author, link, parent, body, ip):
-        from r2.lib.db.queries import changed
         from r2.lib.emailer import message_notification_email
 
         kw = {}
@@ -881,7 +922,8 @@ class Comment(Thing, Printable):
 
         c._commit()
 
-        changed(link, True)  # link's number of comments changed
+        # link's number of comments changed
+        link.update_search_index(boost_only=True)
 
         CommentsByAccount.add_comment(author, c)
 
@@ -904,17 +946,6 @@ class Comment(Thing, Printable):
             inbox_rel = Inbox._add(to, c, name, orangered=True)
 
             if to.pref_email_messages:
-                data = {
-                    'to': to._id36,
-                    'from': '/u/%s' % author.name,
-                    'comment': c._fullname,
-                    'permalink': c.make_permalink_slow(force_domain=True),
-                }
-                data = json.dumps(data)
-                TryLater.schedule('message_notification_email', data,
-                                  NOTIFICATION_EMAIL_DELAY)
-
-            if orangered and to.pref_email_messages:
                 data = {
                     'to': to._id36,
                     'from': '/u/%s' % author.name,
@@ -1040,6 +1071,31 @@ class Comment(Thing, Printable):
 
         return pids
 
+    def _qa(self, children, responder_ids):
+        """Sort a comment according to the Q&A-type sort.
+
+        Arguments:
+
+        * children -- a list of the children of this comment.
+        * responder_ids -- a set of ids of users categorized as "answerers" for
+          this thread.
+        """
+        # This sort type only makes sense for comments, unlike the other sorts
+        # that can be applied to any Things, which is why it's defined here
+        # instead of in Thing.
+
+        op_children = [c for c in children if c.author_id in responder_ids]
+        score = sorts.qa(self._ups, self._downs, len(self.body), op_children)
+
+        # When replies to a question, we want to rank OP replies higher than
+        # non-OP replies (generally).  This is a rough way to do so.
+        # Don't add extra scoring when we've already added it due to replies,
+        # though (because an OP responds to themselves).
+        if self.author_id in responder_ids and not op_children:
+            score *= 2
+
+        return score
+
     @classmethod
     def add_props(cls, user, wrapped):
         from r2.lib.template_helpers import add_attr, get_domain
@@ -1067,9 +1123,8 @@ class Comment(Thing, Printable):
         parent_ids = set(cm.parent_id for cm in wrapped
                          if getattr(cm, 'parent_id', None)
                          and cm.parent_id not in cids)
-        parents = {}
-        if parent_ids:
-            parents = Comment._byID(parent_ids, data=True, stale=True)
+        parents = Comment._byID(
+            parent_ids, data=True, stale=True, ignore_missing=True)
 
         can_reply_srs = set(s._id for s in subreddits if s.can_comment(user)) \
                         if c.user_is_loggedin else set()
@@ -1117,18 +1172,20 @@ class Comment(Thing, Printable):
                          link=item.link.make_permalink(item.subreddit))
             if not hasattr(item, 'target'):
                 item.target = "_top" if cname else None
+
+            parent = None
             if item.parent_id:
                 if item.parent_id in parents:
                     parent = parents[item.parent_id]
-                else:
+                elif item.parent_id in cids:
                     parent = cids[item.parent_id]
-                if not parent.deleted:
-                    if item.parent_id in cids:
-                        item.parent_permalink = '#' + utils.to36(item.parent_id)
-                    else:
-                        item.parent_permalink = parent.make_permalink(item.link, item.subreddit)
+
+            if parent and not parent.deleted:
+                if item.parent_id in cids:
+                    # parent is displayed on the page, use an anchor tag
+                    item.parent_permalink = '#' + utils.to36(item.parent_id)
                 else:
-                    item.parent_permalink = None
+                    item.parent_permalink = parent.make_permalink(item.link, item.subreddit)
             else:
                 item.parent_permalink = None
 
@@ -1229,12 +1286,12 @@ class Comment(Thing, Printable):
 
             item.collapsed = False
             distinguished = item.distinguished and item.distinguished != "no"
-            prevent_collapse = profilepage or user_is_admin or distinguished
+            item.prevent_collapse = profilepage or user_is_admin or distinguished
 
             if (item.deleted and item.subreddit.collapse_deleted_comments and
-                    not prevent_collapse):
+                    not item.prevent_collapse):
                 item.collapsed = True
-            elif item.score < min_score and not prevent_collapse:
+            elif item.score < min_score and not item.prevent_collapse:
                 item.collapsed = True
                 item.collapsed_reason = _("comment score below threshold")
             elif user_is_loggedin and item.author_id in c.user.enemies:
@@ -1245,7 +1302,7 @@ class Comment(Thing, Printable):
 
             item.editted = getattr(item, "editted", False)
 
-            item.render_css_class = "comment %s" % CachedVariable("time_period")
+            item.render_css_class = "comment"
 
             #will get updated in builder
             item.num_children = 0
@@ -1316,6 +1373,40 @@ class CommentSortsCache(tdb_cassandra.View):
     _read_consistency_level = tdb_cassandra.CL.ONE
     _fetch_all_columns = True
 
+
+class CommentScoresByLink(tdb_cassandra.View):
+    _use_db = True
+    _connection_pool = 'main'
+    _read_consistency_level = tdb_cassandra.CL.ONE
+    _fetch_all_columns = True
+
+    _extra_schema_creation_args = {
+        "column_name_class": ASCII_TYPE,
+        "default_validation_class": DOUBLE_TYPE,
+        "key_validation_class": ASCII_TYPE,
+    }
+    _value_type = "bytes"
+    _compare_with = ASCII_TYPE
+
+    @classmethod
+    def _rowkey(cls, link, sort):
+        assert sort.startswith('_')
+        return '%s%s' % (link._id36, sort)
+
+    @classmethod
+    def set_scores(cls, link, sort, scores_by_comment):
+        rowkey = cls._rowkey(link, sort)
+        cls._set_values(rowkey, scores_by_comment)
+
+    @classmethod
+    def get_scores(cls, link, sort):
+        rowkey = cls._rowkey(link, sort)
+        try:
+            return CommentScoresByLink._byID(rowkey)._values()
+        except tdb_cassandra.NotFound:
+            return {}
+
+
 class StarkComment(Comment):
     """Render class for the comments in the top-comments display in
        the reddit toolbar"""
@@ -1382,8 +1473,6 @@ class MoreComments(Printable):
         return False
 
     def __init__(self, link, depth, parent_id=None):
-        from r2.lib.wrapped import CachedVariable
-
         if parent_id is not None:
             id36 = utils.to36(parent_id)
             self.parent_id = parent_id
@@ -1394,7 +1483,6 @@ class MoreComments(Printable):
         self.depth = depth
         self.children = []
         self.count = 0
-        self.previous_visits_hex = CachedVariable("previous_visits_hex")
 
     @property
     def _fullname(self):

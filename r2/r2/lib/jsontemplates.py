@@ -25,6 +25,7 @@ import calendar
 from utils import to36, tup, iters
 from wrapped import Wrapped, StringTemplate, CacheStub, CachedVariable, Templated
 from mako.template import Template
+from r2.config import feature
 from r2.config.extensions import get_api_subtype
 from r2.lib.filters import spaceCompress, safemarkdown
 from r2.models import Account, Report
@@ -299,10 +300,6 @@ class SubredditJsonTemplate(ThingJsonTemplate):
             if thing.community_rules:
                 return thing.community_rules.split('\n')
             return []
-        elif attr == 'related_subreddits':
-            if thing.related_subreddits:
-                return thing.related_subreddits.split('\n')
-            return []
         else:
             return ThingJsonTemplate.thing_attr(self, thing, attr)
 
@@ -355,8 +352,7 @@ class LabeledMultiJsonTemplate(LabeledMultiDescriptionJsonTemplate):
         sr_props = dict(thing.sr_props)
         if expand:
             for sr in srs:
-                sr_props[sr._id].update(
-                    TrimmedSubredditJsonTemplate().data(sr))
+                sr_props[sr._id]["data"] = TrimmedSubredditJsonTemplate().data(sr)
         return [dict(sr_props[sr._id], name=sr.name) for sr in srs]
 
     def thing_attr(self, thing, attr):
@@ -378,8 +374,8 @@ class LabeledMultiJsonTemplate(LabeledMultiDescriptionJsonTemplate):
 
 class TrimmedSubredditJsonTemplate(SubredditJsonTemplate):
     _data_attrs_ = dict(
-        name="name",
-        fullname="_fullname",
+        name="_fullname",
+        display_name="name",
         header_img="header",
         header_size="header_size",
         icon_img="icon_img",
@@ -529,6 +525,11 @@ class LinkJsonTemplate(ThingJsonTemplate):
         url="url",
     )
 
+    def __init__(self):
+        super(LinkJsonTemplate, self).__init__()
+        if feature.is_enabled('default_sort'):
+            self._data_attrs_['default_sort'] = 'default_sort'
+
     def thing_attr(self, thing, attr):
         from r2.lib.media import get_media_embed
         if attr in ("media_embed", "secure_media_embed"):
@@ -572,6 +573,9 @@ class LinkJsonTemplate(ThingJsonTemplate):
 
         if c.permalink_page:
             d["upvote_ratio"] = thing.upvote_ratio
+
+        if feature.is_enabled('default_sort'):
+            d['suggested_sort'] = thing.sort_if_suggested()
 
         return d
 
@@ -1134,6 +1138,9 @@ class SubredditSettingsTemplate(ThingJsonTemplate):
     def thing_attr(self, thing, attr):
         if attr.startswith('site.') and thing.site:
             return getattr(thing.site, attr[5:])
+        if attr == 'related_subreddits':
+            # string used for form input
+            return '\n'.join(thing.related_subreddits)
         return ThingJsonTemplate.thing_attr(self, thing, attr)
 
     def raw_data(self, thing):

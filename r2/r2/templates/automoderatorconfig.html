@@ -20,3 +20,10 @@
 ## reddit Inc. All Rights Reserved.
 ###############################################################################
 
+<%!
+    from r2.lib.filters import SC_OFF, SC_ON, unsafe
+%>
+
+<pre>
+  <code>${unsafe(SC_OFF)}${thing.automoderator_config}${unsafe(SC_ON)}</code>
+</pre>

@@ -30,15 +30,6 @@ from pylons.i18n import _
 
 from r2.lib.db import tdb_cassandra
 from r2.lib.utils import tup
-from r2.models import (
-    Account,
-    Comment,
-    DefaultSR,
-    Link,
-    ModSR,
-    MultiReddit,
-    Subreddit,
-)
 
 
 class ModAction(tdb_cassandra.UuidThing):
@@ -67,8 +58,8 @@ class ModAction(tdb_cassandra.UuidThing):
                'editsettings', 'editflair', 'distinguish', 'marknsfw', 
                'wikibanned', 'wikicontributor', 'wikiunbanned', 'wikipagelisted',
                'removewikicontributor', 'wikirevise', 'wikipermlevel',
-               'ignorereports', 'unignorereports', 'setpermissions', 'sticky',
-               'unsticky')
+               'ignorereports', 'unignorereports', 'setpermissions',
+               'setsuggestedsort', 'sticky', 'unsticky')
 
     _menu = {'banuser': _('ban user'),
              'unbanuser': _('unban user'),
@@ -97,6 +88,7 @@ class ModAction(tdb_cassandra.UuidThing):
              'ignorereports': _('ignore reports'),
              'unignorereports': _('unignore reports'),
              'setpermissions': _('permissions'),
+             'setsuggestedsort': _('set suggested sort'),
              'sticky': _('sticky post'),
              'unsticky': _('unsticky post'),
             }
@@ -128,6 +120,7 @@ class ModAction(tdb_cassandra.UuidThing):
              'ignorereports': _('ignored reports'),
              'unignorereports': _('unignored reports'),
              'setpermissions': _('changed permissions on'),
+             'setsuggestedsort': _('set suggested sort'),
              'sticky': _('stickied'),
              'unsticky': _('unstickied'),
             }
@@ -194,6 +187,8 @@ class ModAction(tdb_cassandra.UuidThing):
 
     @classmethod
     def create(cls, sr, mod, action, details=None, target=None, description=None):
+        from r2.models import DefaultSR
+
         # Split this off into separate function to check for valid actions?
         if not action in cls.actions:
             raise ValueError("Invalid ModAction: %s" % action)
@@ -279,6 +274,13 @@ class ModAction(tdb_cassandra.UuidThing):
         from r2.lib.db.thing import Thing
         from r2.lib.menus import QueryButton
         from r2.lib.pages import WrappedUser
+        from r2.models import (
+            Account,
+            Link,
+            ModSR,
+            MultiReddit,
+            Subreddit,
+        )
 
         target_names = {item.target_fullname for item in wrapped
                             if hasattr(item, "target_fullname")}
@@ -319,6 +321,9 @@ class ModAction(tdb_cassandra.UuidThing):
                 if hasattr(item.target, "link_id"):
                     parent_link_name = item.target.link_id
                     item.parent_link = parent_links[parent_link_name]
+
+                if isinstance(item.target, Account):
+                    item.target_author = item.target
 
         if c.render_style == "html":
             request_path = request.path
