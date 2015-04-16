@@ -35,7 +35,7 @@
   ${thing.srtopbar}
   <div id="header-bottom-left">
     <%
-        header_title = c.site.header_title
+        header_title = g.header_title
         d = DefaultSR()
         if c.site.header and c.can_apply_styles and c.allow_styles:
             header_img = c.site.header
@@ -52,7 +52,7 @@
             title=header_title, size=header_size)}
     % else:
         ## <a href="/" id="header-img" class="default-header" title="${header_title}">${g.domain}</a>
-        <a href="/" id="header-img" class="default-header" title="${header_title}">Discuss MIT</a>
+        <a href="/" id="header-img" class="default-header" title="${header_title}">${header_title}</a>
     % endif
     
     ##keeps the height of the header from varying when there isnt any content
