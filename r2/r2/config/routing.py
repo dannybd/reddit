@@ -263,7 +263,7 @@ def make_map():
     mc('/health/caches', controller='health', action='cachehealth')
 
     # MIT fix
-    mc('/', controller='forms', action='debug')
+    mc('/welcome', controller='hot', action='listing')
     mc('/shib-login', controller='post', action='shib_login')
     mc('/login-check', controller='post', action='login_check')
     mc('/login-required', controller='post', action='login_required')
