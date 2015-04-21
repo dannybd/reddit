@@ -41,7 +41,9 @@ class CookieAuthenticationProvider(AuthenticationProvider):
     }
 
     def is_logout_allowed(self):
-        return True
+        # Because we are relying on Touchstone auth (which is external),
+        # reddit-based logout is meaningless.
+        return False
 
     def get_authenticated_account(self):
         from r2.models import Account, NotFound
