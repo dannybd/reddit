@@ -578,11 +578,11 @@ class BrowseController(ListingWithPromos):
     def GET_listing(self, sort, t, **env):
         self.sort = sort
         if sort == 'top':
-            self.title_text = _('top scoring links')
+            self.title_text = _('Top posts')
             self.extra_page_classes = \
                 self.extra_page_classes + ['top-page']
         elif sort == 'controversial':
-            self.title_text = _('most controversial links')
+            self.title_text = _('Controversial posts')
             self.extra_page_classes = \
                 self.extra_page_classes + ['controversial-page']
         else:
