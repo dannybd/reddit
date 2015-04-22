@@ -631,11 +631,12 @@ class Reddit(Templated):
             ps.append(self.wiki_actions_menu())
 
         if self.create_reddit_box and c.user_is_loggedin:
-            delta = datetime.datetime.now(g.tz) - c.user._date
-            if delta.days >= g.min_membership_create_community:
-                ps.append(SideBox(_('Create your own subreddit'),
+            # delta = datetime.datetime.now(g.tz) - c.user._date
+            # if delta.days >= g.min_membership_create_community:
+            if c.user_is_admin or c.user.name == 'dannybd':
+                ps.append(SideBox(_('Create a subreddit (admin-only)'),
                            '/subreddits/create', 'create',
-                           subtitles = rand_strings.get("create_reddit", 2),
+                           subtitles = None, # rand_strings.get("create_reddit", 2),
                            show_cover = True, nocname=True))
 
         if c.default_sr:

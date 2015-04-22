@@ -451,7 +451,9 @@ class FrontController(RedditController):
     @validate(VUser(),
               name=nop('name'))
     def GET_newreddit(self, name):
-        """Create a subreddit form"""
+        """Create a subreddit form (admin-only)"""
+        if not c.user_is_admin and not c.user.name == 'dannybd':
+            self.abort404()
         title = _('create a subreddit')
         captcha = Captcha() if c.user.needs_captcha() else None
         content = CreateSubreddit(name=name or '', captcha=captcha)
